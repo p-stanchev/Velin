@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+/debug/
+
+# Rust backup files
+**/*.rs.bk
+
+# Debug symbols
+*.pdb
+
+# Mutation testing
+**/mutants.out*/
+
+# Coverage and profiling output
+*.profraw
+*.profdata
+coverage/
+
+# Environment files
+.env
+.env.*
+
+# Editor and IDE files
+.idea/
+*.iml
+.vscode/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
