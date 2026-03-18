@@ -35,7 +35,7 @@ The app is intended to work over both Ethernet and Wi-Fi, with the main focus on
 ```text
 +----------------+      LAN / local network      +----------------+
 | Source machine | ----------------------------> | Target machine |
-| capture audio  |     stream + session ctrl    | play audio     |
+| capture audio  |     stream + session ctrl     | play audio     |
 +----------------+                               +----------------+
 ```
 
@@ -133,9 +133,9 @@ velin/
 ### Phase 1: MVP
 
 - [x] Workspace and crate structure
-- [ ] Source and target role selection
+- [x] Source and target role selection
 - [ ] Automatic peer discovery
-- [ ] Manual IP connection fallback
+- [x] Manual IP connection fallback
 - [ ] Audio device enumeration
 - [ ] Full system audio capture on Windows and Linux
 - [ ] Stream audio to a target and play on a selected output
@@ -171,6 +171,13 @@ Velin is still early in development. Setup and runtime details will change as th
 git clone https://github.com/p-stanchev/velin.git
 cd velin
 cargo run -p velin-app
+```
+
+The app opens a GUI by default. Terminal mode is available as a fallback:
+
+```bash
+cargo run -p velin-app -- listen
+cargo run -p velin-app -- connect 127.0.0.1
 ```
 
 ### Requirements
