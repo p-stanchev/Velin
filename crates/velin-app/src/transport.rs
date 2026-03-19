@@ -11,7 +11,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
-    Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, Hello,
+    Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
+    Hello,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -135,7 +136,11 @@ pub async fn run_source(
 ) -> Result<()> {
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
     let mut stream = tokio::select! {
-        result = TcpStream::connect(&control_addr) => result.with_context(|| format!("failed to connect to target control channel at {control_addr}"))?,
+        result = time::timeout(Duration::from_secs(3), TcpStream::connect(&control_addr)) => {
+            result
+                .context("timed out while connecting to receiver control channel")?
+                .with_context(|| format!("failed to connect to target control channel at {control_addr}"))?
+        },
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
     };
 
@@ -213,16 +218,16 @@ async fn run_discovery_broadcaster(
         .set_broadcast(true)
         .context("failed to enable broadcast on discovery socket")?;
 
-    let addresses = advertised_ipv4_addresses(&bind_ip);
+    let addresses = advertised_ipv4_addresses_for(&bind_ip);
     if addresses.is_empty() {
         return Ok(());
     }
 
-    let announcement = DiscoveryAnnouncement {
+    let announcement = DiscoveryPacket::Announcement(DiscoveryAnnouncement {
         machine_name: host_name(),
         control_port,
         addresses,
-    };
+    });
     let payload = serde_json::to_vec(&announcement).context("failed to encode discovery packet")?;
     let destination = format!("255.255.255.255:{DEFAULT_DISCOVERY_PORT}");
     let mut ticker = time::interval(Duration::from_secs(1));
@@ -305,7 +310,7 @@ fn normalized_bind_ip(bind_ip: &str) -> String {
     }
 }
 
-fn advertised_ipv4_addresses(bind_ip: &str) -> Vec<String> {
+pub fn advertised_ipv4_addresses_for(bind_ip: &str) -> Vec<String> {
     if bind_ip != "0.0.0.0" {
         return vec![bind_ip.to_string()];
     }

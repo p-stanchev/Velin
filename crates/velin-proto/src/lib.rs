@@ -27,6 +27,13 @@ pub struct DiscoveryAnnouncement {
     pub addresses: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscoveryPacket {
+    Announcement(DiscoveryAnnouncement),
+    Request { requester_name: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
     pub sequence: u64,

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time;
-use velin_proto::{DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement};
+use velin_proto::{DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket};
 
 const PEER_TTL: Duration = Duration::from_secs(4);
 const DISCOVERY_TICK: Duration = Duration::from_millis(800);
@@ -13,6 +13,25 @@ const DISCOVERY_TICK: Duration = Duration::from_millis(800);
 pub struct DiscoveredPeer {
     pub label: String,
     pub ip: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryAdvertiser {
+    state: Arc<Mutex<Option<DiscoveryAnnouncement>>>,
+}
+
+impl DiscoveryAdvertiser {
+    pub fn set(&self, announcement: DiscoveryAnnouncement) {
+        *self.state.lock().expect("discovery advertiser poisoned") = Some(announcement);
+    }
+
+    pub fn clear(&self) {
+        *self.state.lock().expect("discovery advertiser poisoned") = None;
+    }
+
+    fn current(&self) -> Option<DiscoveryAnnouncement> {
+        self.state.lock().expect("discovery advertiser poisoned").clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -24,7 +43,7 @@ struct PeerRecord {
 
 pub type PeerUpdateSink = Arc<dyn Fn(Vec<DiscoveredPeer>) + Send + Sync>;
 
-pub async fn run_discovery_listener(update: PeerUpdateSink) -> Result<()> {
+pub async fn run_discovery_service(update: PeerUpdateSink, advertiser: DiscoveryAdvertiser) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{DEFAULT_DISCOVERY_PORT}");
     let socket = UdpSocket::bind(&bind_addr)
         .await
@@ -37,19 +56,21 @@ pub async fn run_discovery_listener(update: PeerUpdateSink) -> Result<()> {
     loop {
         tokio::select! {
             result = socket.recv_from(&mut packet) => {
-                let (len, _from) = result.context("failed to receive discovery announcement")?;
-                if let Ok(announcement) = serde_json::from_slice::<DiscoveryAnnouncement>(&packet[..len]) {
-                    let now = Instant::now();
-                    for address in announcement.addresses {
-                        let key = format!("{}|{}", announcement.machine_name, address);
-                        peers.insert(key, PeerRecord {
-                            machine_name: announcement.machine_name.clone(),
-                            ip: address,
-                            last_seen: now,
-                        });
+                let (len, from) = result.context("failed to receive discovery packet")?;
+                if let Ok(message) = serde_json::from_slice::<DiscoveryPacket>(&packet[..len]) {
+                    match message {
+                        DiscoveryPacket::Announcement(announcement) => {
+                            remember_announcement(&mut peers, announcement);
+                            emit_peer_snapshot(&peers, &update);
+                        }
+                        DiscoveryPacket::Request { .. } => {
+                            if let Some(announcement) = advertiser.current() {
+                                let payload = serde_json::to_vec(&DiscoveryPacket::Announcement(announcement))
+                                    .context("failed to encode discovery response")?;
+                                let _ = socket.send_to(&payload, from).await;
+                            }
+                        }
                     }
-
-                    emit_peer_snapshot(&peers, &update);
                 }
             }
             _ = ticker.tick() => {
@@ -58,6 +79,38 @@ pub async fn run_discovery_listener(update: PeerUpdateSink) -> Result<()> {
                 emit_peer_snapshot(&peers, &update);
             }
         }
+    }
+}
+
+pub async fn request_discovery(requester_name: String) -> Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("failed to bind discovery request socket")?;
+    socket
+        .set_broadcast(true)
+        .context("failed to enable broadcast on discovery socket")?;
+    let payload = serde_json::to_vec(&DiscoveryPacket::Request { requester_name })
+        .context("failed to encode discovery request")?;
+    let destination = format!("255.255.255.255:{DEFAULT_DISCOVERY_PORT}");
+    socket
+        .send_to(&payload, &destination)
+        .await
+        .context("failed to send discovery request")?;
+    Ok(())
+}
+
+fn remember_announcement(peers: &mut HashMap<String, PeerRecord>, announcement: DiscoveryAnnouncement) {
+    let now = Instant::now();
+    for address in announcement.addresses {
+        let key = format!("{}|{}", announcement.machine_name, address);
+        peers.insert(
+            key,
+            PeerRecord {
+                machine_name: announcement.machine_name.clone(),
+                ip: address,
+                last_seen: now,
+            },
+        );
     }
 }
 

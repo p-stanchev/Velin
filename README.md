@@ -14,7 +14,7 @@ LAN audio routing prototype for Windows and Linux
 
 </div>
 
-> Velin is an early desktop prototype for moving audio-related session traffic between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, LAN receiver discovery with manual IP fallback, saved basic settings, output device selection, and a working TCP/UDP transport path using generated audio frames.
+> Velin is an early desktop prototype for sending system audio between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, LAN receiver discovery with manual IP fallback, saved basic settings, output device selection, and a working TCP/UDP transport path.
 
 <p align="center">
   <a href="#current-state">Current State</a> |
@@ -46,19 +46,22 @@ What exists now:
 - CLI fallback commands for transport testing
 - A bind-IP setting for receiver mode
 - Output device enumeration and selection for receiver playback
-- Receiver playback of generated test audio
+- Receiver playback of streamed audio
 - Windows system audio capture for sender mode via WASAPI loopback
+- Linux system audio capture for sender mode via monitor-source capture (`parec`)
 
 What it does not do yet:
 
-- Linux system audio capture backend setup and validation
 - Per-app routing
+- Stream diagnostics beyond simple status text
+- Trusted pairing or encryption
+- Sample-rate conversion
 
 ```text
 +----------------+      local network       +----------------+
 | Sender machine | -----------------------> | Receiver       |
-| generated test |   TCP control + UDP      | receives test  |
-| frames         |                          | frames         |
+| system audio   |   TCP control + UDP      | plays stream   |
+| capture        |                          | audio          |
 +----------------+                          +----------------+
 ```
 
@@ -74,7 +77,7 @@ What it does not do yet:
 | Settings | Target IP, bind IP, output device, control port, audio port, and theme are saved locally |
 | Transport | TCP handshake (`Hello` -> `Accept`) and UDP frame path work |
 | Sender behavior | Windows sender mode uses WASAPI loopback. Linux sender mode uses a monitor-source capture path on PipeWire/PulseAudio systems |
-| Receiver behavior | Receiver advertises itself on LAN, accepts a connection, plays generated test audio, and reports frame activity |
+| Receiver behavior | Receiver advertises itself on LAN, accepts a connection, plays streamed audio, and reports frame activity |
 | Session controls | Start, stop, disconnect, and mute are available in the GUI |
 | CLI fallback | `listen` and `connect <ip>` still work |
 
@@ -84,9 +87,9 @@ What it does not do yet:
 
 These are still planned, not implemented:
 
-- System audio capture on Windows
 - Stream diagnostics beyond simple status text
 - Trusted pairing or encryption
+- Per-app routing
 
 ---
 
@@ -114,7 +117,10 @@ velin/
 |-- crates/
 |   |-- velin-app
 |   |   `-- src/
+|   |       |-- audio.rs
 |   |       |-- app.rs
+|   |       |-- capture.rs
+|   |       |-- discovery.rs
 |   |       |-- main.rs
 |   |       |-- settings.rs
 |   |       |-- transport.rs
@@ -156,7 +162,6 @@ velin/
 
 ### Phase 3: Advanced Routing
 
-- [ ] Local mute while streaming
 - [ ] Specific or per-application audio capture
 - [ ] Microphone forwarding
 - [ ] Virtual sinks and sources
@@ -180,7 +185,8 @@ GUI:
 
 - Open the `Session` tab
 - Use `Start Receiver` on one machine
-- Use `Start Sender` on another machine, with the receiver IP entered
+- Use `Refresh` in sender mode to look for receivers, or enter the receiver IP manually
+- Use `Start Sender` on the other machine once a receiver is selected or entered
 
 CLI fallback:
 
@@ -203,10 +209,10 @@ cargo run -p velin-app -- connect 127.0.0.1
 
 - Windows sender mode now captures real system audio from the default render endpoint.
 - Linux sender mode now captures system audio through a monitor source using `parec`. It can use `VELIN_LINUX_MONITOR` to override the detected monitor source when needed.
-- The current receiver can play generated test frames on a selected output device.
+- The current receiver can play streamed audio on a selected output device.
 - Linux is part of the project target, but the current prototype work has primarily been exercised on Windows.
 - Receiver mode can bind to `Automatic` (`0.0.0.0`) or a specific local IPv4 address.
-- Receiver discovery currently uses local-network UDP broadcast announcements.
+- Receiver discovery uses local-network UDP discovery packets, and sender mode also has a manual refresh action.
 - The current TCP handshake is minimal and unencrypted. Encryption and trusted pairing are future work.
 - Receiver playback currently uses the selected device's default output config. Sample-rate conversion is not implemented yet.
 - Windows capture currently expects the default system mix format to be `48 kHz`.

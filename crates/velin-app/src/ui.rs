@@ -99,6 +99,7 @@ slint::slint! {
         callback start-source(string);
         callback stop-session();
         callback toggle-mute();
+        callback refresh-discovery();
         callback save-settings(string, string, string, string, string, bool);
         callback choose-discovered-peer(string);
         callback report-bug();
@@ -335,39 +336,58 @@ slint::slint! {
                                     font-size: 12px;
                                 }
 
-                                Rectangle {
+                                HorizontalBox {
+                                    spacing: 8px;
                                     height: 38px;
-                                    background: transparent;
 
                                     Rectangle {
-                                        height: 38px;
-                                        border-radius: 9px;
-                                        border-width: 1px;
-                                        border-color: root.border;
-                                        background: root.dark-mode ? #1c1c1c : #ffffff;
+                                        background: transparent;
 
-                                        Text {
-                                            x: 12px;
-                                            y: (parent.height - self.height) / 2;
-                                            text: root.discovered-peer-selection;
-                                            color: root.dark-mode ? #f2f2f2 : #171717;
-                                            font-size: 13px;
+                                        Rectangle {
+                                            height: 38px;
+                                            border-radius: 9px;
+                                            border-width: 1px;
+                                            border-color: root.border;
+                                            background: root.dark-mode ? #1c1c1c : #ffffff;
+
+                                            Text {
+                                                x: 12px;
+                                                y: (parent.height - self.height) / 2;
+                                                text: root.discovered-peer-selection;
+                                                color: root.dark-mode ? #f2f2f2 : #171717;
+                                                font-size: 13px;
+                                            }
+
+                                            Text {
+                                                x: parent.width - self.width - 14px;
+                                                y: (parent.height - self.height) / 2 - 1px;
+                                                text: root.discovered-peer-menu-open ? "˄" : "˅";
+                                                color: root.dark-mode ? #c9c9c9 : #5a564f;
+                                                font-size: 13px;
+                                            }
+
+                                            TouchArea {
+                                                enabled: !root.running && root.discovered-peer-selection != "No receivers found";
+                                                clicked => {
+                                                    root.discovered-peer-menu-open = !root.discovered-peer-menu-open;
+                                                    root.bind-ip-menu-open = false;
+                                                    root.output-device-menu-open = false;
+                                                }
+                                            }
                                         }
+                                    }
 
-                                        Text {
-                                            x: parent.width - self.width - 14px;
-                                            y: (parent.height - self.height) / 2 - 1px;
-                                            text: root.discovered-peer-menu-open ? "˄" : "˅";
-                                            color: root.dark-mode ? #c9c9c9 : #5a564f;
-                                            font-size: 13px;
-                                        }
+                                    Rectangle {
+                                        width: 86px;
+                                        background: transparent;
 
-                                        TouchArea {
-                                            enabled: !root.running && root.discovered-peer-selection != "No receivers found";
+                                        FlatButton {
+                                            text: "Refresh";
+                                            dark-mode: root.dark-mode;
+                                            clickable: !root.running;
                                             clicked => {
-                                                root.discovered-peer-menu-open = !root.discovered-peer-menu-open;
-                                                root.bind-ip-menu-open = false;
-                                                root.output-device-menu-open = false;
+                                                root.discovered-peer-menu-open = false;
+                                                root.refresh-discovery();
                                             }
                                         }
                                     }

@@ -1,9 +1,9 @@
 use crate::audio::{default_output_device_name, output_device_names};
-use crate::discovery::{DiscoveredPeer, PeerUpdateSink, run_discovery_listener};
+use crate::discovery::{DiscoveredPeer, DiscoveryAdvertiser, PeerUpdateSink, request_discovery, run_discovery_service};
 use crate::settings::{AppSettings, SettingsStore, ThemeMode};
 use crate::transport::{
-    StatusSink, local_ipv4_addresses, local_ipv4_summary, local_machine_name, local_primary_ipv4,
-    run_source, run_target,
+    StatusSink, advertised_ipv4_addresses_for, local_ipv4_addresses, local_ipv4_summary,
+    local_machine_name, local_primary_ipv4, run_source, run_target,
 };
 use crate::ui::AppWindow;
 use anyhow::{Context, Result, anyhow};
@@ -51,6 +51,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     let store = Arc::new(SettingsStore::new()?);
     let settings = Arc::new(Mutex::new(store.load_or_default()?));
     let discovered_peers = Arc::new(Mutex::new(Vec::<DiscoveredPeer>::new()));
+    let discovery_advertiser = DiscoveryAdvertiser::default();
     let app = AppWindow::new().context("failed to create Slint app window")?;
     let session_state = Arc::new(Mutex::new(SessionState::default()));
 
@@ -111,8 +112,9 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
             });
         });
 
+        let advertiser = discovery_advertiser.clone();
         runtime.spawn(async move {
-            let _ = run_discovery_listener(update).await;
+            let _ = run_discovery_service(update, advertiser).await;
         });
     }
 
@@ -185,6 +187,21 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     }
 
     {
+        let runtime = Arc::clone(&runtime);
+        let weak = app.as_weak();
+        app.on_refresh_discovery(move || {
+            let weak = weak.clone();
+            runtime.spawn(async move {
+                if let Err(error) = request_discovery(local_machine_name()).await {
+                    set_status(&weak, format!("Discovery refresh failed. {error}"));
+                } else {
+                    set_status(&weak, "Refreshing receivers...".to_string());
+                }
+            });
+        });
+    }
+
+    {
         let weak = app.as_weak();
         app.on_report_bug(move || {
             if let Err(error) = open_bug_report_page() {
@@ -198,6 +215,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         let weak = app.as_weak();
         let session_state = Arc::clone(&session_state);
         let settings = Arc::clone(&settings);
+        let discovery_advertiser = discovery_advertiser.clone();
         app.on_start_target(move || {
             if is_running(&session_state) {
                 return;
@@ -207,14 +225,20 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
             let status = ui_status_sink(&weak);
             let (stop_rx, mute_rx) = begin_session(&session_state);
             let config = settings.lock().expect("settings poisoned").session_config();
+            discovery_advertiser.set(velin_proto::DiscoveryAnnouncement {
+                machine_name: local_machine_name(),
+                control_port: config.control_port,
+                addresses: advertised_ipv4_addresses_for(&config.bind_ip),
+            });
             set_running(&weak, true);
             set_muted(&weak, false);
             status("Starting target...".to_string());
 
             let session_state = Arc::clone(&session_state);
+            let discovery_advertiser = discovery_advertiser.clone();
             runtime.spawn(async move {
                 let result = run_target(config, status.clone(), stop_rx, mute_rx).await;
-                finish_session(&weak, &session_state, status, result);
+                finish_session(&weak, &session_state, status, result, Some(&discovery_advertiser));
             });
         });
     }
@@ -252,7 +276,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
             let session_state = Arc::clone(&session_state);
             runtime.spawn(async move {
                 let result = run_source(config, status.clone(), stop_rx, mute_rx).await;
-                finish_session(&weak, &session_state, status, result);
+                finish_session(&weak, &session_state, status, result, None);
             });
         });
     }
@@ -486,6 +510,7 @@ fn finish_session(
     state: &Arc<Mutex<SessionState>>,
     status: StatusSink,
     result: Result<()>,
+    discovery_advertiser: Option<&DiscoveryAdvertiser>,
 ) {
     let exit_when_stopped = {
         let mut state = state.lock().expect("session state poisoned");
@@ -500,6 +525,9 @@ fn finish_session(
         Err(error) => status(describe_session_error(&error)),
     }
 
+    if let Some(advertiser) = discovery_advertiser {
+        advertiser.clear();
+    }
     set_running(weak, false);
     set_muted(weak, false);
 
