@@ -20,6 +20,7 @@ pub struct OutputPlayer {
     _stream: Stream,
     buffer: Arc<Mutex<PlaybackBuffer>>,
     muted: Arc<AtomicBool>,
+    config_summary: String,
 }
 
 impl OutputPlayer {
@@ -37,6 +38,10 @@ impl OutputPlayer {
 
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn config_summary(&self) -> &str {
+        &self.config_summary
     }
 }
 
@@ -84,6 +89,13 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
             _stream: stream,
             buffer,
             muted,
+            config_summary: format!(
+                "{} Hz, {} ch, {:?}, {:?}",
+                stream_config.sample_rate,
+                stream_config.channels,
+                sample_format,
+                stream_config.buffer_size
+            ),
         },
         device_name,
     ))

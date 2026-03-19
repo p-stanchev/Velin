@@ -73,6 +73,7 @@ pub async fn run_target(
         format!("Receiver listening on {bind_ip}:{}.", config.control_port)
     });
     status(format!("Playback device: {device_name}."));
+    status(format!("Playback config: {}.", player.config_summary()));
 
     let (mut stream, peer_addr) = tokio::select! {
         result = listener.accept() => result.context("failed to accept source")?,
@@ -178,11 +179,13 @@ pub async fn run_source(
     for sequence in 0_u64.. {
         let Some(mut samples) = (tokio::select! {
             chunk = capture.recv() => chunk,
-            result = wait_for_control_disconnect(&mut control_read) => {
-                result?;
-                status("Receiver disconnected.".to_string());
-                return Ok(());
-            }
+            result = poll_control_channel(&mut control_read) => match result? {
+                ControlChannelState::Closed => {
+                    status("Receiver disconnected.".to_string());
+                    return Ok(());
+                }
+                ControlChannelState::Alive => continue,
+            },
             _ = wait_for_stop(&mut stop_rx) => return Ok(()),
         }) else {
             bail!("system audio capture ended unexpectedly");
@@ -259,11 +262,17 @@ async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn wait_for_control_disconnect(stream: &mut OwnedReadHalf) -> Result<()> {
-    match stream.read_u8().await {
-        Ok(_) => bail!("receiver control channel sent unexpected data"),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
-        Err(error) => Err(error).context("receiver control channel failed"),
+enum ControlChannelState {
+    Alive,
+    Closed,
+}
+
+async fn poll_control_channel(stream: &mut OwnedReadHalf) -> Result<ControlChannelState> {
+    match time::timeout(Duration::from_millis(5), stream.read_u8()).await {
+        Ok(Ok(_)) => bail!("receiver control channel sent unexpected data"),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(ControlChannelState::Closed),
+        Ok(Err(error)) => Err(error).context("receiver control channel failed"),
+        Err(_) => Ok(ControlChannelState::Alive),
     }
 }
 

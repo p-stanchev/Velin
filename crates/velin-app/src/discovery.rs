@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time;
 use velin_proto::{DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket};
+use crate::transport::{local_ipv4_addresses, local_machine_name};
 
 const PEER_TTL: Duration = Duration::from_secs(4);
 const DISCOVERY_TICK: Duration = Duration::from_millis(800);
@@ -50,6 +51,8 @@ pub async fn run_discovery_service(update: PeerUpdateSink, advertiser: Discovery
         .with_context(|| format!("failed to bind discovery listener on {bind_addr}"))?;
 
     let mut peers = HashMap::<String, PeerRecord>::new();
+    let local_name = local_machine_name();
+    let local_ips = local_ipv4_addresses();
     let mut packet = vec![0_u8; 2048];
     let mut ticker = time::interval(DISCOVERY_TICK);
 
@@ -60,7 +63,7 @@ pub async fn run_discovery_service(update: PeerUpdateSink, advertiser: Discovery
                 if let Ok(message) = serde_json::from_slice::<DiscoveryPacket>(&packet[..len]) {
                     match message {
                         DiscoveryPacket::Announcement(announcement) => {
-                            remember_announcement(&mut peers, announcement);
+                            remember_announcement(&mut peers, announcement, &local_name, &local_ips);
                             emit_peer_snapshot(&peers, &update);
                         }
                         DiscoveryPacket::Request { .. } => {
@@ -99,9 +102,22 @@ pub async fn request_discovery(requester_name: String) -> Result<()> {
     Ok(())
 }
 
-fn remember_announcement(peers: &mut HashMap<String, PeerRecord>, announcement: DiscoveryAnnouncement) {
+fn remember_announcement(
+    peers: &mut HashMap<String, PeerRecord>,
+    announcement: DiscoveryAnnouncement,
+    local_name: &str,
+    local_ips: &[String],
+) {
+    if announcement.machine_name == local_name {
+        return;
+    }
+
     let now = Instant::now();
     for address in announcement.addresses {
+        if local_ips.iter().any(|value| value == &address) {
+            continue;
+        }
+
         let key = format!("{}|{}", announcement.machine_name, address);
         peers.insert(
             key,
