@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+local-ip-address.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slint.workspace = true
