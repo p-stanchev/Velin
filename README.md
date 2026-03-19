@@ -7,8 +7,8 @@
 LAN audio routing prototype for Windows and Linux
 
 [![Rust](https://img.shields.io/badge/Rust-systems-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Windows](https://img.shields.io/badge/Windows-supported-0078D6?style=flat-square&logo=windows)](.)
-[![Linux](https://img.shields.io/badge/Linux-planned-FCC624?style=flat-square&logo=linux&logoColor=black)](.)
+[![Windows](https://img.shields.io/badge/Windows-tested-0078D6?style=flat-square&logo=windows)](.)
+[![Linux](https://img.shields.io/badge/Linux-target-FCC624?style=flat-square&logo=linux&logoColor=black)](.)
 [![Status](https://img.shields.io/badge/status-prototype-555?style=flat-square)](.)
 [![License](https://img.shields.io/badge/license-MIT-111111?style=flat-square)](LICENSE)
 
@@ -42,6 +42,7 @@ What exists now:
 - TCP control handshake plus UDP frame streaming
 - Stop handling and graceful window-close shutdown
 - CLI fallback commands for transport testing
+- A bind-IP setting for receiver mode
 
 What it does not do yet:
 
@@ -70,11 +71,10 @@ What it does not do yet:
 | Roles | Sender and receiver actions are available in the session tab |
 | Connection | Manual IP connect works |
 | Settings | Target IP, control port, audio port, and theme are saved locally |
-| Transport | TCP control channel and UDP frame path work |
+| Transport | TCP handshake (`Hello` -> `Accept`) and UDP frame path work |
 | Test signal | Sender currently streams generated dummy PCM frames |
 | Receiver behavior | Receiver accepts a connection and reports frame activity |
 | CLI fallback | `listen` and `connect <ip>` still work |
-| Windows icon | Embedded `.ico` resource is wired into the app executable |
 
 ---
 
@@ -100,7 +100,7 @@ These are still planned, not implemented:
 | Language | Rust |
 | UI | Slint |
 | Async runtime | Tokio |
-| Wire format | JSON control messages + raw PCM test frames |
+| Wire format | JSON control messages (`Hello` / `Accept`) + raw PCM test frames |
 | Transport | TCP for control, UDP for frame streaming |
 | Config and storage | Serde + local JSON settings |
 
@@ -113,13 +113,9 @@ This is the current repo shape, not the final intended crate layout:
 ```text
 velin/
 |-- assets/
-|   |-- logo.svg
-|   |-- logo-black.ico
-|   `-- logo-white.ico
+|   `-- logo.svg
 |-- crates/
 |   |-- velin-app
-|   |   |-- build.rs
-|   |   |-- velin-app.rc
 |   |   `-- src/
 |   |       |-- app.rs
 |   |       |-- main.rs
@@ -146,6 +142,7 @@ velin/
 - [x] Persisted basic settings
 - [x] Dark and light mode
 - [x] TCP/UDP transport prototype
+- [x] Basic TCP handshake (`Hello` / `Accept`)
 - [ ] Automatic peer discovery
 - [ ] Real receiver playback
 - [ ] Real system audio capture
@@ -211,6 +208,8 @@ cargo run -p velin-app -- connect 127.0.0.1
 - The current sender uses generated test frames, not live system audio.
 - The current receiver logs frame activity through app status updates; it does not play audio yet.
 - Linux is part of the project target, but the current prototype work has primarily been exercised on Windows.
+- Receiver mode can bind to `Automatic` (`0.0.0.0`) or a specific local IPv4 address.
+- The current TCP handshake is minimal and unencrypted. Encryption and trusted pairing are future work.
 
 ---
 
