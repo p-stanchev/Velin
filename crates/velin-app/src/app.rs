@@ -1,4 +1,5 @@
 use crate::audio::{default_output_device_name, output_device_names};
+use crate::discovery::{DiscoveredPeer, PeerUpdateSink, run_discovery_listener};
 use crate::settings::{AppSettings, SettingsStore, ThemeMode};
 use crate::transport::{
     StatusSink, local_ipv4_addresses, local_ipv4_summary, local_machine_name, local_primary_ipv4,
@@ -14,8 +15,14 @@ use tokio::sync::watch;
 
 #[derive(Default)]
 struct SessionState {
-    current: Option<watch::Sender<bool>>,
+    current: Option<SessionControls>,
     exit_when_stopped: bool,
+}
+
+#[derive(Clone)]
+struct SessionControls {
+    stop_tx: watch::Sender<bool>,
+    mute_tx: watch::Sender<bool>,
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
@@ -26,14 +33,15 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let config = settings.session_config();
     let status = cli_status_sink();
     let (_stop_tx, stop_rx) = watch::channel(false);
+    let (_mute_tx, mute_rx) = watch::channel(false);
 
     match mode {
-        "target" | "listen" => run_target(config, status, stop_rx).await,
+        "target" | "listen" => run_target(config, status, stop_rx, mute_rx).await,
         "source" | "connect" => {
             let address = args.get(2).map(String::as_str).ok_or_else(usage)?;
             let mut config = config;
             config.target_ip = address.to_string();
-            run_source(config, status, stop_rx).await
+            run_source(config, status, stop_rx, mute_rx).await
         }
         _ => Err(usage()),
     }
@@ -42,6 +50,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     let store = Arc::new(SettingsStore::new()?);
     let settings = Arc::new(Mutex::new(store.load_or_default()?));
+    let discovered_peers = Arc::new(Mutex::new(Vec::<DiscoveredPeer>::new()));
     let app = AppWindow::new().context("failed to create Slint app window")?;
     let session_state = Arc::new(Mutex::new(SessionState::default()));
 
@@ -65,6 +74,46 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.set_local_primary_ip(local_primary_ipv4().into());
         app.set_status_text("Idle".into());
         app.set_log_text("Velin ready.\n".into());
+        app.set_discovered_peer_options(ModelRc::new(VecModel::from(vec![
+            slint::SharedString::from("No receivers found"),
+        ])));
+        app.set_discovered_peer_selection("No receivers found".into());
+    }
+
+    {
+        let weak = app.as_weak();
+        let discovered_peers = Arc::clone(&discovered_peers);
+        let update: PeerUpdateSink = Arc::new(move |peers| {
+            {
+                let mut state = discovered_peers.lock().expect("discovered peers poisoned");
+                *state = peers.clone();
+            }
+
+            let labels: Vec<slint::SharedString> = if peers.is_empty() {
+                vec![slint::SharedString::from("No receivers found")]
+            } else {
+                peers.iter()
+                    .map(|peer| slint::SharedString::from(peer.label.clone()))
+                    .collect()
+            };
+            let selection = labels
+                .first()
+                .cloned()
+                .unwrap_or_else(|| slint::SharedString::from("No receivers found"));
+
+            let _ = weak.upgrade_in_event_loop(move |app| {
+                app.set_discovered_peer_options(ModelRc::new(VecModel::from(labels)));
+                if app.get_discovered_peer_selection().is_empty()
+                    || app.get_discovered_peer_selection() == "No receivers found"
+                {
+                    app.set_discovered_peer_selection(selection);
+                }
+            });
+        });
+
+        runtime.spawn(async move {
+            let _ = run_discovery_listener(update).await;
+        });
     }
 
     {
@@ -81,6 +130,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.on_select_settings_tab(move || {
             if let Some(app) = app_handle.upgrade() {
                 app.set_active_tab(1);
+                app.set_discovered_peer_menu_open(false);
             }
         });
     }
@@ -114,6 +164,28 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
 
     {
         let weak = app.as_weak();
+        let discovered_peers = Arc::clone(&discovered_peers);
+        app.on_choose_discovered_peer(move |label| {
+            let label = label.to_string();
+            let peer = discovered_peers
+                .lock()
+                .expect("discovered peers poisoned")
+                .iter()
+                .find(|peer| peer.label == label)
+                .cloned();
+
+            if let Some(peer) = peer {
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    app.set_target_ip(peer.ip.clone().into());
+                    app.set_discovered_peer_selection(peer.label.clone().into());
+                    app.set_discovered_peer_menu_open(false);
+                });
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
         app.on_report_bug(move || {
             if let Err(error) = open_bug_report_page() {
                 set_status(&weak, format!("Failed to open bug report page. {error}"));
@@ -133,14 +205,15 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
 
             let weak = weak.clone();
             let status = ui_status_sink(&weak);
-            let stop_rx = begin_session(&session_state);
+            let (stop_rx, mute_rx) = begin_session(&session_state);
             let config = settings.lock().expect("settings poisoned").session_config();
             set_running(&weak, true);
+            set_muted(&weak, false);
             status("Starting target...".to_string());
 
             let session_state = Arc::clone(&session_state);
             runtime.spawn(async move {
-                let result = run_target(config, status.clone(), stop_rx).await;
+                let result = run_target(config, status.clone(), stop_rx, mute_rx).await;
                 finish_session(&weak, &session_state, status, result);
             });
         });
@@ -169,15 +242,16 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
 
             let weak = weak.clone();
             let status = ui_status_sink(&weak);
-            let stop_rx = begin_session(&session_state);
+            let (stop_rx, mute_rx) = begin_session(&session_state);
             let mut config = settings.lock().expect("settings poisoned").session_config();
             config.target_ip = target_ip.clone();
             set_running(&weak, true);
+            set_muted(&weak, false);
             status(format!("Starting source for {target_ip}..."));
 
             let session_state = Arc::clone(&session_state);
             runtime.spawn(async move {
-                let result = run_source(config, status.clone(), stop_rx).await;
+                let result = run_source(config, status.clone(), stop_rx, mute_rx).await;
                 finish_session(&weak, &session_state, status, result);
             });
         });
@@ -188,6 +262,14 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         let session_state = Arc::clone(&session_state);
         app.on_stop_session(move || {
             request_stop(&weak, &session_state, false);
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let session_state = Arc::clone(&session_state);
+        app.on_toggle_mute(move || {
+            toggle_mute(&weak, &session_state);
         });
     }
 
@@ -390,12 +472,13 @@ fn ui_status_sink(weak: &slint::Weak<AppWindow>) -> StatusSink {
     })
 }
 
-fn begin_session(state: &Arc<Mutex<SessionState>>) -> watch::Receiver<bool> {
+fn begin_session(state: &Arc<Mutex<SessionState>>) -> (watch::Receiver<bool>, watch::Receiver<bool>) {
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (mute_tx, mute_rx) = watch::channel(false);
     let mut state = state.lock().expect("session state poisoned");
-    state.current = Some(stop_tx);
+    state.current = Some(SessionControls { stop_tx, mute_tx });
     state.exit_when_stopped = false;
-    stop_rx
+    (stop_rx, mute_rx)
 }
 
 fn finish_session(
@@ -418,6 +501,7 @@ fn finish_session(
     }
 
     set_running(weak, false);
+    set_muted(weak, false);
 
     if exit_when_stopped {
         let _ = slint::quit_event_loop();
@@ -428,7 +512,7 @@ fn request_stop(weak: &slint::Weak<AppWindow>, state: &Arc<Mutex<SessionState>>,
     let sender = {
         let mut state = state.lock().expect("session state poisoned");
         state.exit_when_stopped = exit_when_stopped;
-        state.current.clone()
+        state.current.as_ref().map(|controls| controls.stop_tx.clone())
     };
 
     if let Some(sender) = sender {
@@ -450,6 +534,27 @@ fn is_running(state: &Arc<Mutex<SessionState>>) -> bool {
     state.lock().expect("session state poisoned").current.is_some()
 }
 
+fn toggle_mute(weak: &slint::Weak<AppWindow>, state: &Arc<Mutex<SessionState>>) {
+    let sender = {
+        let state = state.lock().expect("session state poisoned");
+        state.current.as_ref().map(|controls| controls.mute_tx.clone())
+    };
+
+    if let Some(sender) = sender {
+        let next = !*sender.borrow();
+        let _ = sender.send(next);
+        set_muted(weak, next);
+        set_status(
+            weak,
+            if next {
+                "Session muted.".to_string()
+            } else {
+                "Session unmuted.".to_string()
+            },
+        );
+    }
+}
+
 fn set_status(weak: &slint::Weak<AppWindow>, message: String) {
     let _ = weak.upgrade_in_event_loop(move |app| {
         app.set_status_text(message.into());
@@ -459,6 +564,12 @@ fn set_status(weak: &slint::Weak<AppWindow>, message: String) {
 fn set_running(weak: &slint::Weak<AppWindow>, running: bool) {
     let _ = weak.upgrade_in_event_loop(move |app| {
         app.set_running(running);
+    });
+}
+
+fn set_muted(weak: &slint::Weak<AppWindow>, muted: bool) {
+    let _ = weak.upgrade_in_event_loop(move |app| {
+        app.set_muted(muted);
     });
 }
 

@@ -76,6 +76,8 @@ slint::slint! {
         in-out property <string> bind-ip-selection: "Automatic";
         in-out property <[string]> output-device-options: ["System Default"];
         in-out property <string> output-device-selection: "System Default";
+        in-out property <[string]> discovered-peer-options: ["No receivers found"];
+        in-out property <string> discovered-peer-selection: "No receivers found";
         in-out property <string> control-port: "49000";
         in-out property <string> audio-port: "49001";
         in-out property <string> status-text: "Idle";
@@ -89,18 +91,22 @@ slint::slint! {
         in-out property <bool> sender-mode: false;
         in-out property <bool> bind-ip-menu-open: false;
         in-out property <bool> output-device-menu-open: false;
+        in-out property <bool> discovered-peer-menu-open: false;
+        in-out property <bool> muted: false;
         callback select-session-tab();
         callback select-settings-tab();
         callback start-target();
         callback start-source(string);
         callback stop-session();
+        callback toggle-mute();
         callback save-settings(string, string, string, string, string, bool);
+        callback choose-discovered-peer(string);
         callback report-bug();
 
         title: "Velin";
         icon: @image-url("../../assets/logo.svg");
         width: 680px;
-        height: 600px;
+        height: 620px;
 
         in property <color> bg: root.dark-mode ? #171717 : #f4f2ed;
         in property <color> panel-bg: root.dark-mode ? #1f1f1f : #fbfaf7;
@@ -136,6 +142,7 @@ slint::slint! {
                             clicked => {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
+                                root.discovered-peer-menu-open = false;
                                 root.select-session-tab();
                             }
                         }
@@ -153,6 +160,7 @@ slint::slint! {
                             clicked => {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
+                                root.discovered-peer-menu-open = false;
                                 root.select-settings-tab();
                             }
                         }
@@ -168,6 +176,7 @@ slint::slint! {
                             clicked => {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
+                                root.discovered-peer-menu-open = false;
                                 root.report-bug();
                             }
                         }
@@ -232,7 +241,7 @@ slint::slint! {
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
-                    height: 228px;
+                    height: root.sender-mode ? 280px : 252px;
 
                     VerticalBox {
                         padding: 18px;
@@ -260,7 +269,10 @@ slint::slint! {
                                     dark-mode: root.dark-mode;
                                     active: !root.sender-mode;
                                     clickable: !root.running;
-                                    clicked => { root.sender-mode = false; }
+                                    clicked => {
+                                        root.sender-mode = false;
+                                        root.discovered-peer-menu-open = false;
+                                    }
                                 }
                             }
 
@@ -281,7 +293,7 @@ slint::slint! {
                         }
 
                         Rectangle {
-                            height: 72px;
+                            height: root.sender-mode ? 118px : 72px;
                             background: transparent;
 
                             if !root.sender-mode : VerticalBox {
@@ -318,6 +330,50 @@ slint::slint! {
                                 spacing: 8px;
 
                                 Text {
+                                    text: "Discovered receivers";
+                                    color: root.text-tertiary;
+                                    font-size: 12px;
+                                }
+
+                                Rectangle {
+                                    height: 38px;
+                                    background: transparent;
+
+                                    Rectangle {
+                                        height: 38px;
+                                        border-radius: 9px;
+                                        border-width: 1px;
+                                        border-color: root.border;
+                                        background: root.dark-mode ? #1c1c1c : #ffffff;
+
+                                        Text {
+                                            x: 12px;
+                                            y: (parent.height - self.height) / 2;
+                                            text: root.discovered-peer-selection;
+                                            color: root.dark-mode ? #f2f2f2 : #171717;
+                                            font-size: 13px;
+                                        }
+
+                                        Text {
+                                            x: parent.width - self.width - 14px;
+                                            y: (parent.height - self.height) / 2 - 1px;
+                                            text: root.discovered-peer-menu-open ? "˄" : "˅";
+                                            color: root.dark-mode ? #c9c9c9 : #5a564f;
+                                            font-size: 13px;
+                                        }
+
+                                        TouchArea {
+                                            enabled: !root.running && root.discovered-peer-selection != "No receivers found";
+                                            clicked => {
+                                                root.discovered-peer-menu-open = !root.discovered-peer-menu-open;
+                                                root.bind-ip-menu-open = false;
+                                                root.output-device-menu-open = false;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text {
                                     text: "Receiver IP";
                                     color: root.text-tertiary;
                                     font-size: 12px;
@@ -340,6 +396,7 @@ slint::slint! {
                             Rectangle {
                                 width: 120px;
                                 background: transparent;
+                                height: 28px;
 
                                 FlatButton {
                                     text: root.sender-mode ? "Start Sender" : "Start Receiver";
@@ -358,6 +415,21 @@ slint::slint! {
                             Rectangle {
                                 width: 120px;
                                 background: transparent;
+                                height: 28px;
+
+                                FlatButton {
+                                    text: root.muted ? "Unmute" : "Mute";
+                                    dark-mode: root.dark-mode;
+                                    active: root.muted;
+                                    clickable: root.running;
+                                    clicked => { root.toggle-mute(); }
+                                }
+                            }
+
+                            Rectangle {
+                                width: 120px;
+                                background: transparent;
+                                height: 28px;
 
                                 FlatButton {
                                     text: "Stop";
@@ -368,6 +440,52 @@ slint::slint! {
                             }
 
                             Rectangle { background: transparent; }
+                        }
+                    }
+
+                    if root.discovered-peer-menu-open : Rectangle {
+                        x: 18px;
+                        y: 152px;
+                        width: parent.width - 36px;
+                        height: min(root.discovered-peer-options.length * 30px + 12px, 132px);
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: root.border;
+                        background: root.dark-mode ? #1c1c1c : #ffffff;
+                        clip: true;
+
+                        ScrollView {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: self.visible-width;
+                            viewport-height: root.discovered-peer-options.length * 30px;
+
+                            VerticalBox {
+                                spacing: 0px;
+
+                                for option[index] in root.discovered-peer-options : Rectangle {
+                                    height: 30px;
+                                    background: option == root.discovered-peer-selection
+                                        ? (root.dark-mode ? #232923 : #eef3ec)
+                                        : (peer-option-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+
+                                    Text {
+                                        x: 12px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: option;
+                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                        font-size: 13px;
+                                    }
+
+                                    peer-option-touch := TouchArea {
+                                        clicked => {
+                                            root.choose-discovered-peer(option);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -696,7 +814,7 @@ slint::slint! {
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
-                    height: 96px;
+                    height: 76px;
 
                     ScrollView {
                         x: 10px;

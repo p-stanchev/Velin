@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 49000;
 pub const DEFAULT_AUDIO_PORT: u16 = 49001;
+pub const DEFAULT_DISCOVERY_PORT: u16 = 49002;
 pub const FRAME_SAMPLES: usize = 480;
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
@@ -17,6 +18,13 @@ pub struct Hello {
 pub struct Accept {
     pub target_name: String,
     pub audio_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryAnnouncement {
+    pub machine_name: String,
+    pub control_port: u16,
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

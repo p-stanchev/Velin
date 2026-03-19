@@ -14,7 +14,7 @@ LAN audio routing prototype for Windows and Linux
 
 </div>
 
-> Velin is an early desktop prototype for moving audio-related session traffic between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, manual IP connection, saved basic settings, output device selection, and a working TCP/UDP transport path using generated audio frames.
+> Velin is an early desktop prototype for moving audio-related session traffic between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, LAN receiver discovery with manual IP fallback, saved basic settings, output device selection, and a working TCP/UDP transport path using generated audio frames.
 
 <p align="center">
   <a href="#current-state">Current State</a> |
@@ -37,11 +37,12 @@ What exists now:
 - A Slint desktop GUI with `Session` and `Settings` tabs
 - `Sender` and `Receiver` session modes in the app
 - Manual IP connection for sender mode
+- Automatic receiver discovery in the GUI
 - Persisted local settings for target IP, control port, audio port, and theme
 - Persisted local settings for bind IP and output device selection
 - Dark and light mode in the app
 - TCP control handshake plus UDP frame streaming
-- Stop handling and graceful window-close shutdown
+- Stop, disconnect, mute, and graceful window-close shutdown
 - CLI fallback commands for transport testing
 - A bind-IP setting for receiver mode
 - Output device enumeration and selection for receiver playback
@@ -49,9 +50,7 @@ What exists now:
 
 What it does not do yet:
 
-- Auto-discovery
 - Real system audio capture
-- Mute control
 - Per-app routing
 
 ```text
@@ -70,11 +69,12 @@ What it does not do yet:
 | --- | --- |
 | GUI | Starts by default with a small desktop window |
 | Roles | Sender and receiver actions are available in the session tab |
-| Connection | Manual IP connect works |
+| Connection | Receiver discovery works, with manual IP connect as fallback |
 | Settings | Target IP, bind IP, output device, control port, audio port, and theme are saved locally |
 | Transport | TCP handshake (`Hello` -> `Accept`) and UDP frame path work |
 | Test signal | Sender currently streams generated dummy PCM frames |
-| Receiver behavior | Receiver accepts a connection, plays generated test audio, and reports frame activity |
+| Receiver behavior | Receiver advertises itself on LAN, accepts a connection, plays generated test audio, and reports frame activity |
+| Session controls | Start, stop, disconnect, and mute are available in the GUI |
 | CLI fallback | `listen` and `connect <ip>` still work |
 
 ---
@@ -83,10 +83,8 @@ What it does not do yet:
 
 These are still planned, not implemented:
 
-- LAN auto-discovery
 - System audio capture on Windows
 - System audio capture on Linux
-- Local mute while streaming
 - Stream diagnostics beyond simple status text
 - Trusted pairing or encryption
 
@@ -144,9 +142,9 @@ velin/
 - [x] Basic TCP handshake (`Hello` / `Accept`)
 - [x] Real receiver playback
 - [x] Audio device enumeration
-- [ ] Automatic peer discovery
+- [x] Automatic peer discovery
 - [ ] Real system audio capture
-- [ ] Basic connect/disconnect/mute session controls
+- [x] Basic connect/disconnect/mute session controls
 
 ### Phase 2: Real Audio Routing
 
@@ -203,10 +201,11 @@ cargo run -p velin-app -- connect 127.0.0.1
 
 ## Notes
 
-- The current sender uses generated test frames, not live system audio.
+- The current sender uses generated test frames, not live system audio yet.
 - The current receiver can play generated test frames on a selected output device.
 - Linux is part of the project target, but the current prototype work has primarily been exercised on Windows.
 - Receiver mode can bind to `Automatic` (`0.0.0.0`) or a specific local IPv4 address.
+- Receiver discovery currently uses local-network UDP broadcast announcements.
 - The current TCP handshake is minimal and unencrypted. Encryption and trusted pairing are future work.
 - Receiver playback currently uses the selected device's default output config. Sample-rate conversion is not implemented yet.
 

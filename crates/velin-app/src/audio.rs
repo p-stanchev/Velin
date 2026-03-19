@@ -3,6 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{I24, U24, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use velin_proto::{CHANNELS, SAMPLE_RATE_HZ};
 
@@ -16,6 +17,7 @@ struct PlaybackBuffer {
 pub struct OutputPlayer {
     _stream: Stream,
     buffer: Arc<Mutex<PlaybackBuffer>>,
+    muted: Arc<AtomicBool>,
 }
 
 impl OutputPlayer {
@@ -29,6 +31,10 @@ impl OutputPlayer {
             let overflow = buffer.samples.len() - MAX_BUFFERED_SAMPLES;
             buffer.samples.drain(0..overflow);
         }
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
     }
 }
 
@@ -59,7 +65,15 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
     let sample_format = supported_config.sample_format();
     let output_channels = stream_config.channels as usize;
     let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
-    let stream = build_stream(&device, &stream_config, sample_format, output_channels, Arc::clone(&buffer))?;
+    let muted = Arc::new(AtomicBool::new(false));
+    let stream = build_stream(
+        &device,
+        &stream_config,
+        sample_format,
+        output_channels,
+        Arc::clone(&buffer),
+        Arc::clone(&muted),
+    )?;
 
     stream.play().context("failed to start output stream")?;
 
@@ -67,6 +81,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
         OutputPlayer {
             _stream: stream,
             buffer,
+            muted,
         },
         device_name,
     ))
@@ -106,20 +121,21 @@ fn build_stream(
     sample_format: SampleFormat,
     output_channels: usize,
     buffer: Arc<Mutex<PlaybackBuffer>>,
+    muted: Arc<AtomicBool>,
 ) -> Result<Stream> {
     let error_callback = |error| eprintln!("audio output stream error: {error}");
 
     match sample_format {
-        SampleFormat::I8 => build_stream_for_format::<i8>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::F32 => build_stream_for_format::<f32>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::F64 => build_stream_for_format::<f64>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::I16 => build_stream_for_format::<i16>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::I24 => build_stream_for_format::<I24>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::I32 => build_stream_for_format::<i32>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::U8 => build_stream_for_format::<u8>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::U16 => build_stream_for_format::<u16>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::U24 => build_stream_for_format::<U24>(device, config, output_channels, buffer, error_callback),
-        SampleFormat::U32 => build_stream_for_format::<u32>(device, config, output_channels, buffer, error_callback),
+        SampleFormat::I8 => build_stream_for_format::<i8>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::F32 => build_stream_for_format::<f32>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::F64 => build_stream_for_format::<f64>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::I16 => build_stream_for_format::<i16>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::I24 => build_stream_for_format::<I24>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::I32 => build_stream_for_format::<i32>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::U8 => build_stream_for_format::<u8>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::U16 => build_stream_for_format::<u16>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::U24 => build_stream_for_format::<U24>(device, config, output_channels, buffer, muted, error_callback),
+        SampleFormat::U32 => build_stream_for_format::<u32>(device, config, output_channels, buffer, muted, error_callback),
         other => Err(anyhow!("unsupported output sample format: {other:?}")),
     }
 }
@@ -129,6 +145,7 @@ fn build_stream_for_format<T>(
     config: &StreamConfig,
     output_channels: usize,
     buffer: Arc<Mutex<PlaybackBuffer>>,
+    muted: Arc<AtomicBool>,
     error_callback: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<Stream>
 where
@@ -137,17 +154,29 @@ where
     device
         .build_output_stream(
             config,
-            move |data: &mut [T], _| write_output_data::<T>(data, output_channels, &buffer),
+            move |data: &mut [T], _| write_output_data::<T>(data, output_channels, &buffer, &muted),
             error_callback,
             None,
         )
         .context("failed to build output stream")
 }
 
-fn write_output_data<T>(data: &mut [T], output_channels: usize, buffer: &Arc<Mutex<PlaybackBuffer>>)
+fn write_output_data<T>(
+    data: &mut [T],
+    output_channels: usize,
+    buffer: &Arc<Mutex<PlaybackBuffer>>,
+    muted: &Arc<AtomicBool>,
+)
 where
     T: Sample + cpal::FromSample<f32>,
 {
+    if muted.load(Ordering::Relaxed) {
+        for sample in data.iter_mut() {
+            *sample = T::from_sample(0.0);
+        }
+        return;
+    }
+
     let mut playback = buffer.lock().expect("playback buffer poisoned");
 
     for frame in data.chunks_mut(output_channels) {

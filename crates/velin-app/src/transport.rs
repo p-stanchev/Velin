@@ -10,7 +10,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time;
-use velin_proto::{Accept, AudioFrame, CHANNELS, FRAME_SAMPLES, Hello, SAMPLE_RATE_HZ};
+use velin_proto::{
+    Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, FRAME_SAMPLES,
+    Hello, SAMPLE_RATE_HZ,
+};
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -27,6 +30,7 @@ pub async fn run_target(
     config: SessionConfig,
     status: StatusSink,
     mut stop_rx: watch::Receiver<bool>,
+    mut mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let bind_ip = normalized_bind_ip(&config.bind_ip);
     let control_addr = format!("{bind_ip}:{}", config.control_port);
@@ -40,6 +44,17 @@ pub async fn run_target(
         .with_context(|| format!("failed to bind audio socket on {audio_addr}"))?;
     let (player, device_name) = open_output_device(&config.output_device_name)
         .context("failed to open playback device")?;
+    let discovery_status = Arc::clone(&status);
+    let discovery_bind_ip = bind_ip.clone();
+    let discovery_control_port = config.control_port;
+    let mut discovery_stop_rx = stop_rx.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_discovery_broadcaster(discovery_bind_ip, discovery_control_port, &mut discovery_stop_rx).await
+        {
+            discovery_status(format!("Discovery broadcast unavailable. {error}"));
+        }
+    });
 
     status(if bind_ip == "0.0.0.0" {
         let local_ips = local_ipv4_addresses();
@@ -81,6 +96,12 @@ pub async fn run_target(
     loop {
         let (len, from) = tokio::select! {
             result = audio_socket.recv_from(&mut packet) => result.context("failed to receive audio frame")?,
+            result = mute_rx.changed() => {
+                if result.is_ok() {
+                    player.set_muted(*mute_rx.borrow());
+                }
+                continue;
+            }
             _ = wait_for_stop(&mut stop_rx) => return Ok(()),
         };
 
@@ -111,6 +132,7 @@ pub async fn run_source(
     config: SessionConfig,
     status: StatusSink,
     mut stop_rx: watch::Receiver<bool>,
+    mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
     let mut stream = tokio::select! {
@@ -144,6 +166,7 @@ pub async fn run_source(
     let mut ticker = time::interval(frame_duration());
     let mut phase = 0.0_f32;
     let step = 440.0_f32 / SAMPLE_RATE_HZ as f32;
+    let mute_rx = mute_rx;
 
     for sequence in 0_u64.. {
         tokio::select! {
@@ -152,9 +175,14 @@ pub async fn run_source(
         }
 
         let mut samples = Vec::with_capacity(FRAME_SAMPLES * CHANNELS as usize);
+        let muted = *mute_rx.borrow();
         for _ in 0..FRAME_SAMPLES {
-            let sample = (phase * TAU).sin();
-            let pcm = (sample * i16::MAX as f32 * 0.2) as i16;
+            let pcm = if muted {
+                0
+            } else {
+                let sample = (phase * TAU).sin();
+                (sample * i16::MAX as f32 * 0.2) as i16
+            };
             for _ in 0..CHANNELS {
                 samples.push(pcm);
             }
@@ -179,6 +207,42 @@ pub async fn run_source(
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+async fn run_discovery_broadcaster(
+    bind_ip: String,
+    control_port: u16,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("failed to bind discovery broadcast socket")?;
+    socket
+        .set_broadcast(true)
+        .context("failed to enable broadcast on discovery socket")?;
+
+    let addresses = advertised_ipv4_addresses(&bind_ip);
+    if addresses.is_empty() {
+        return Ok(());
+    }
+
+    let announcement = DiscoveryAnnouncement {
+        machine_name: host_name(),
+        control_port,
+        addresses,
+    };
+    let payload = serde_json::to_vec(&announcement).context("failed to encode discovery packet")?;
+    let destination = format!("255.255.255.255:{DEFAULT_DISCOVERY_PORT}");
+    let mut ticker = time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let _ = socket.send_to(&payload, &destination).await;
+            }
+            _ = wait_for_stop(stop_rx) => return Ok(()),
+        }
+    }
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
@@ -251,6 +315,14 @@ fn normalized_bind_ip(bind_ip: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn advertised_ipv4_addresses(bind_ip: &str) -> Vec<String> {
+    if bind_ip != "0.0.0.0" {
+        return vec![bind_ip.to_string()];
+    }
+
+    local_ipv4_addresses()
 }
 
 pub fn local_primary_ipv4() -> String {

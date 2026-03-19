@@ -1,4 +1,5 @@
 mod audio;
+mod discovery;
 mod app;
 mod settings;
 mod transport;
