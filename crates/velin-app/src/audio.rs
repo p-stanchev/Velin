@@ -134,7 +134,7 @@ fn stream_config_for_playback(supported_config: &SupportedStreamConfig) -> Strea
 
 #[cfg(target_os = "linux")]
 fn choose_linux_buffer_size(buffer_size: &SupportedBufferSize) -> BufferSize {
-    const TARGET_FRAMES: u32 = 2048;
+    const TARGET_FRAMES: u32 = 4096;
 
     match buffer_size {
         SupportedBufferSize::Range { min, max } => BufferSize::Fixed(TARGET_FRAMES.clamp(*min, *max)),

@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedReadHalf};
 use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
@@ -161,6 +161,7 @@ pub async fn run_source(
         result = read_json_message(&mut stream) => result,
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
     }?;
+    let (mut control_read, _control_write) = stream.into_split();
     let audio_addr = format!("{}:{}", config.target_ip, accept.audio_port);
 
     let audio_socket = UdpSocket::bind("0.0.0.0:0")
@@ -177,6 +178,11 @@ pub async fn run_source(
     for sequence in 0_u64.. {
         let Some(mut samples) = (tokio::select! {
             chunk = capture.recv() => chunk,
+            result = wait_for_control_disconnect(&mut control_read) => {
+                result?;
+                status("Receiver disconnected.".to_string());
+                return Ok(());
+            }
             _ = wait_for_stop(&mut stop_rx) => return Ok(()),
         }) else {
             bail!("system audio capture ended unexpectedly");
@@ -250,6 +256,14 @@ async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
         if stop_rx.changed().await.is_err() {
             return;
         }
+    }
+}
+
+async fn wait_for_control_disconnect(stream: &mut OwnedReadHalf) -> Result<()> {
+    match stream.read_u8().await {
+        Ok(_) => bail!("receiver control channel sent unexpected data"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
+        Err(error) => Err(error).context("receiver control channel failed"),
     }
 }
 
