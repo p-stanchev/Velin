@@ -12,5 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 slint.workspace = true
 tokio.workspace = true
-windows.workspace = true
 velin-proto = { path = "../velin-proto" }
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
