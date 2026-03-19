@@ -301,9 +301,60 @@ where
 }
 
 fn host_name() -> String {
+    windows_host_name()
+        .or_else(unix_host_name)
+        .or_else(env_host_name)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn env_host_name() -> Option<String> {
     env::var("COMPUTERNAME")
-        .or_else(|_| env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+        .ok()
+        .or_else(|| env::var("HOSTNAME").ok())
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_host_name() -> Option<String> {
+    env::var("COMPUTERNAME").ok().and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_host_name() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn unix_host_name() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+}
+
+#[cfg(not(unix))]
+fn unix_host_name() -> Option<String> {
+    None
 }
 
 pub fn local_ipv4_summary() -> String {
