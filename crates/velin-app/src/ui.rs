@@ -74,6 +74,8 @@ slint::slint! {
         in-out property <string> bind-ip: "0.0.0.0";
         in-out property <[string]> bind-ip-options: ["Automatic"];
         in-out property <string> bind-ip-selection: "Automatic";
+        in-out property <[string]> output-device-options: ["System Default"];
+        in-out property <string> output-device-selection: "System Default";
         in-out property <string> control-port: "49000";
         in-out property <string> audio-port: "49001";
         in-out property <string> status-text: "Idle";
@@ -86,12 +88,13 @@ slint::slint! {
         in-out property <bool> dark-mode: true;
         in-out property <bool> sender-mode: false;
         in-out property <bool> bind-ip-menu-open: false;
+        in-out property <bool> output-device-menu-open: false;
         callback select-session-tab();
         callback select-settings-tab();
         callback start-target();
         callback start-source(string);
         callback stop-session();
-        callback save-settings(string, string, string, string, bool);
+        callback save-settings(string, string, string, string, string, bool);
         callback report-bug();
 
         title: "Velin";
@@ -132,6 +135,7 @@ slint::slint! {
                             clickable: root.active-tab != 0;
                             clicked => {
                                 root.bind-ip-menu-open = false;
+                                root.output-device-menu-open = false;
                                 root.select-session-tab();
                             }
                         }
@@ -148,6 +152,7 @@ slint::slint! {
                             clickable: root.active-tab != 1;
                             clicked => {
                                 root.bind-ip-menu-open = false;
+                                root.output-device-menu-open = false;
                                 root.select-settings-tab();
                             }
                         }
@@ -162,6 +167,7 @@ slint::slint! {
                             dark-mode: root.dark-mode;
                             clicked => {
                                 root.bind-ip-menu-open = false;
+                                root.output-device-menu-open = false;
                                 root.report-bug();
                             }
                         }
@@ -371,7 +377,7 @@ slint::slint! {
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
-                    height: 258px;
+                    height: 344px;
 
                     VerticalBox {
                         padding: 18px;
@@ -413,7 +419,7 @@ slint::slint! {
                                         clickable: !root.running;
                                         clicked => {
                                             root.dark-mode = true;
-                                            root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                            root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
                                         }
                                     }
 
@@ -424,7 +430,7 @@ slint::slint! {
                                         clickable: !root.running;
                                         clicked => {
                                             root.dark-mode = false;
-                                            root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                            root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
                                         }
                                     }
                                 }
@@ -470,7 +476,55 @@ slint::slint! {
                                             enabled: !root.running;
                                             clicked => {
                                                 root.bind-ip-menu-open = !root.bind-ip-menu-open;
+                                                root.output-device-menu-open = false;
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        VerticalBox {
+                            spacing: 6px;
+
+                            Text {
+                                text: "Output device";
+                                color: root.text-tertiary;
+                                font-size: 12px;
+                            }
+
+                            Rectangle {
+                                height: 38px;
+                                background: transparent;
+
+                                Rectangle {
+                                    height: 38px;
+                                    border-radius: 9px;
+                                    border-width: 1px;
+                                    border-color: root.border;
+                                    background: root.dark-mode ? #1c1c1c : #ffffff;
+
+                                    Text {
+                                        x: 12px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: root.output-device-selection;
+                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                        font-size: 13px;
+                                    }
+
+                                    Text {
+                                        x: parent.width - self.width - 14px;
+                                        y: (parent.height - self.height) / 2 - 1px;
+                                        text: root.output-device-menu-open ? "˄" : "˅";
+                                        color: root.dark-mode ? #c9c9c9 : #5a564f;
+                                        font-size: 13px;
+                                    }
+
+                                    TouchArea {
+                                        enabled: !root.running;
+                                        clicked => {
+                                            root.output-device-menu-open = !root.output-device-menu-open;
+                                            root.bind-ip-menu-open = false;
                                         }
                                     }
                                 }
@@ -495,7 +549,7 @@ slint::slint! {
                                     dark-mode: root.dark-mode;
                                     placeholder: "127.0.0.1";
                                     edited => {
-                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
                                     }
                                 }
                             }
@@ -515,7 +569,7 @@ slint::slint! {
                                     dark-mode: root.dark-mode;
                                     placeholder: "49000";
                                     edited => {
-                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
                                     }
                                 }
                             }
@@ -535,7 +589,7 @@ slint::slint! {
                                     dark-mode: root.dark-mode;
                                     placeholder: "49001";
                                     edited => {
-                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
                                     }
                                 }
                             }
@@ -560,7 +614,7 @@ slint::slint! {
                                 height: 30px;
                                 background: option == root.bind-ip-selection
                                     ? (root.dark-mode ? #232923 : #eef3ec)
-                                    : (touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+                                    : (bind-option-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
 
                                 Text {
                                     x: 12px;
@@ -570,11 +624,59 @@ slint::slint! {
                                     font-size: 13px;
                                 }
 
-                                touch := TouchArea {
+                                bind-option-touch := TouchArea {
                                     clicked => {
                                         root.bind-ip-selection = option;
                                         root.bind-ip-menu-open = false;
-                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.output-device-menu-open : Rectangle {
+                        x: 18px;
+                        y: 164px;
+                        width: parent.width - 36px;
+                        height: min(root.output-device-options.length * 30px + 12px, 162px);
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: root.border;
+                        background: root.dark-mode ? #1c1c1c : #ffffff;
+                        clip: true;
+
+                        ScrollView {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: self.visible-width;
+                            viewport-height: root.output-device-options.length * 30px;
+
+                            VerticalBox {
+                                spacing: 0px;
+
+                                for option[index] in root.output-device-options : Rectangle {
+                                    height: 30px;
+                                    background: option == root.output-device-selection
+                                        ? (root.dark-mode ? #232923 : #eef3ec)
+                                        : (output-option-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+
+                                    Text {
+                                        x: 12px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: option;
+                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                        font-size: 13px;
+                                    }
+
+                                    output-option-touch := TouchArea {
+                                        clicked => {
+                                            root.output-device-selection = option;
+                                            root.output-device-menu-open = false;
+                                            root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        }
                                     }
                                 }
                             }

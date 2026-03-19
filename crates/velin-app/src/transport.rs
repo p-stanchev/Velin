@@ -1,3 +1,4 @@
+use crate::audio::open_output_device;
 use anyhow::{Context, Result, bail};
 use local_ip_address::list_afinet_netifas;
 use std::env;
@@ -17,6 +18,7 @@ pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 pub struct SessionConfig {
     pub target_ip: String,
     pub bind_ip: String,
+    pub output_device_name: String,
     pub control_port: u16,
     pub audio_port: u16,
 }
@@ -36,6 +38,8 @@ pub async fn run_target(
     let audio_socket = UdpSocket::bind(&audio_addr)
         .await
         .with_context(|| format!("failed to bind audio socket on {audio_addr}"))?;
+    let (player, device_name) = open_output_device(&config.output_device_name)
+        .context("failed to open playback device")?;
 
     status(if bind_ip == "0.0.0.0" {
         let local_ips = local_ipv4_addresses();
@@ -53,6 +57,7 @@ pub async fn run_target(
     } else {
         format!("Receiver listening on {bind_ip}:{}.", config.control_port)
     });
+    status(format!("Playback device: {device_name}."));
 
     let (mut stream, peer_addr) = tokio::select! {
         result = listener.accept() => result.context("failed to accept source")?,
@@ -93,6 +98,7 @@ pub async fn run_target(
 
         last_sequence = Some(frame.sequence);
         received_frames += 1;
+        player.push_samples(&frame.samples);
 
         if received_frames == 1 || received_frames % 100 == 0 {
             let seconds = started.elapsed().as_secs_f32();

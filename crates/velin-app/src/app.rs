@@ -1,3 +1,4 @@
+use crate::audio::{default_output_device_name, output_device_names};
 use crate::settings::{AppSettings, SettingsStore, ThemeMode};
 use crate::transport::{
     StatusSink, local_ipv4_addresses, local_ipv4_summary, local_machine_name, local_primary_ipv4,
@@ -47,10 +48,15 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     {
         let current = settings.lock().expect("settings poisoned").clone();
         let bind_ip_options = bind_ip_options();
+        let output_device_options = output_device_options();
         app.set_target_ip(current.target_ip.clone().into());
         app.set_bind_ip(current.bind_ip.clone().into());
         app.set_bind_ip_options(ModelRc::new(VecModel::from(bind_ip_options.clone())));
         app.set_bind_ip_selection(bind_ip_selection_label(&current.bind_ip, &bind_ip_options).into());
+        app.set_output_device_options(ModelRc::new(VecModel::from(output_device_options.clone())));
+        app.set_output_device_selection(
+            output_device_selection_label(&current.output_device_name, &output_device_options).into(),
+        );
         app.set_control_port(current.control_port.to_string().into());
         app.set_audio_port(current.audio_port.to_string().into());
         app.set_dark_mode(matches!(current.theme_mode, ThemeMode::Dark));
@@ -83,13 +89,15 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         let store = Arc::clone(&store);
         let settings = Arc::clone(&settings);
         let weak = app.as_weak();
-        app.on_save_settings(move |target_ip, bind_ip_selection, control_port, audio_port, dark_mode| {
+        app.on_save_settings(move |target_ip, bind_ip_selection, output_device_selection, control_port, audio_port, dark_mode| {
             let target_ip = target_ip.to_string();
             let bind_ip_selection = bind_ip_selection.to_string();
+            let output_device_selection = output_device_selection.to_string();
             let status = ui_status_sink(&weak);
             match parse_settings_input(
                 &target_ip,
                 &selected_bind_ip(&bind_ip_selection),
+                &selected_output_device(&output_device_selection),
                 control_port.as_str(),
                 audio_port.as_str(),
                 dark_mode,
@@ -209,6 +217,14 @@ fn bind_ip_options() -> Vec<slint::SharedString> {
     options
 }
 
+fn output_device_options() -> Vec<slint::SharedString> {
+    let mut options = vec![slint::SharedString::from("System Default")];
+    if let Ok(names) = output_device_names() {
+        options.extend(names.into_iter().map(slint::SharedString::from));
+    }
+    options
+}
+
 fn persist_settings(
     store: &Arc<SettingsStore>,
     settings: &Arc<Mutex<AppSettings>>,
@@ -224,10 +240,15 @@ fn persist_settings(
 
     if let Some(app) = weak.upgrade() {
         let bind_ip_options = bind_ip_options();
+        let output_device_options = output_device_options();
         app.set_target_ip(next.target_ip.clone().into());
         app.set_bind_ip(next.bind_ip.clone().into());
         app.set_bind_ip_options(ModelRc::new(VecModel::from(bind_ip_options.clone())));
         app.set_bind_ip_selection(bind_ip_selection_label(&next.bind_ip, &bind_ip_options).into());
+        app.set_output_device_options(ModelRc::new(VecModel::from(output_device_options.clone())));
+        app.set_output_device_selection(
+            output_device_selection_label(&next.output_device_name, &output_device_options).into(),
+        );
         app.set_control_port(next.control_port.to_string().into());
         app.set_audio_port(next.audio_port.to_string().into());
         app.set_dark_mode(matches!(next.theme_mode, ThemeMode::Dark));
@@ -283,9 +304,37 @@ fn bind_ip_selection_label(bind_ip: &str, options: &[slint::SharedString]) -> St
     }
 }
 
+fn output_device_selection_label(
+    output_device_name: &str,
+    options: &[slint::SharedString],
+) -> String {
+    let normalized = output_device_name.trim();
+    if normalized.is_empty() {
+        return default_output_device_name()
+            .ok()
+            .flatten()
+            .filter(|name| options.iter().any(|value| value.as_str() == name))
+            .unwrap_or_else(|| "System Default".to_string());
+    }
+
+    if options.iter().any(|value| value.as_str() == normalized) {
+        normalized.to_string()
+    } else {
+        "System Default".to_string()
+    }
+}
+
 fn selected_bind_ip(selection: &str) -> String {
     if selection.trim().is_empty() || selection == "Automatic" {
         "0.0.0.0".to_string()
+    } else {
+        selection.trim().to_string()
+    }
+}
+
+fn selected_output_device(selection: &str) -> String {
+    if selection.trim().is_empty() || selection == "System Default" {
+        String::new()
     } else {
         selection.trim().to_string()
     }
@@ -300,6 +349,7 @@ pub fn usage() -> anyhow::Error {
 fn parse_settings_input(
     target_ip: &str,
     bind_ip: &str,
+    output_device_name: &str,
     control_port: &str,
     audio_port: &str,
     dark_mode: bool,
@@ -316,6 +366,7 @@ fn parse_settings_input(
     Ok(AppSettings {
         target_ip: target_ip.trim().to_string(),
         bind_ip: bind_ip.trim().to_string(),
+        output_device_name: output_device_name.trim().to_string(),
         control_port,
         audio_port,
         theme_mode: if dark_mode {
