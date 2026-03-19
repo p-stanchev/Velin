@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{I24, U24, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{I24, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig, U24};
+#[cfg(target_os = "linux")]
+use cpal::{BufferSize, SupportedBufferSize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +63,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
         selected_name.to_string()
     };
     let supported_config = select_stream_config(&device)?;
-    let stream_config = supported_config.config();
+    let stream_config = stream_config_for_playback(&supported_config);
     let sample_format = supported_config.sample_format();
     let output_channels = stream_config.channels as usize;
     let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
@@ -113,6 +115,31 @@ fn select_stream_config(device: &cpal::Device) -> Result<SupportedStreamConfig> 
     device
         .default_output_config()
         .context("failed to read default output config")
+}
+
+fn stream_config_for_playback(supported_config: &SupportedStreamConfig) -> StreamConfig {
+    #[cfg(target_os = "linux")]
+    let mut config = supported_config.config();
+
+    #[cfg(not(target_os = "linux"))]
+    let config = supported_config.config();
+
+    #[cfg(target_os = "linux")]
+    {
+        config.buffer_size = choose_linux_buffer_size(supported_config.buffer_size());
+    }
+
+    config
+}
+
+#[cfg(target_os = "linux")]
+fn choose_linux_buffer_size(buffer_size: &SupportedBufferSize) -> BufferSize {
+    const TARGET_FRAMES: u32 = 2048;
+
+    match buffer_size {
+        SupportedBufferSize::Range { min, max } => BufferSize::Fixed(TARGET_FRAMES.clamp(*min, *max)),
+        SupportedBufferSize::Unknown => BufferSize::Default,
+    }
 }
 
 fn build_stream(
