@@ -47,10 +47,11 @@ What exists now:
 - A bind-IP setting for receiver mode
 - Output device enumeration and selection for receiver playback
 - Receiver playback of generated test audio
+- Windows system audio capture for sender mode via WASAPI loopback
 
 What it does not do yet:
 
-- Real system audio capture
+- Linux system audio capture backend setup and validation
 - Per-app routing
 
 ```text
@@ -72,7 +73,7 @@ What it does not do yet:
 | Connection | Receiver discovery works, with manual IP connect as fallback |
 | Settings | Target IP, bind IP, output device, control port, audio port, and theme are saved locally |
 | Transport | TCP handshake (`Hello` -> `Accept`) and UDP frame path work |
-| Test signal | Sender currently streams generated dummy PCM frames |
+| Sender behavior | Windows sender mode uses WASAPI loopback. Linux sender mode uses a monitor-source capture path on PipeWire/PulseAudio systems |
 | Receiver behavior | Receiver advertises itself on LAN, accepts a connection, plays generated test audio, and reports frame activity |
 | Session controls | Start, stop, disconnect, and mute are available in the GUI |
 | CLI fallback | `listen` and `connect <ip>` still work |
@@ -84,7 +85,6 @@ What it does not do yet:
 These are still planned, not implemented:
 
 - System audio capture on Windows
-- System audio capture on Linux
 - Stream diagnostics beyond simple status text
 - Trusted pairing or encryption
 
@@ -143,13 +143,13 @@ velin/
 - [x] Real receiver playback
 - [x] Audio device enumeration
 - [x] Automatic peer discovery
-- [ ] Real system audio capture
+- [x] Real system audio capture
 - [x] Basic connect/disconnect/mute session controls
 
 ### Phase 2: Real Audio Routing
 
-- [ ] Capture full system audio on Windows
-- [ ] Capture full system audio on Linux
+- [x] Capture full system audio on Windows
+- [x] Capture full system audio on Linux
 - [ ] Improve stream health and latency reporting
 - [ ] Remember preferred peers and devices
 - [ ] Auto-reconnect
@@ -201,13 +201,16 @@ cargo run -p velin-app -- connect 127.0.0.1
 
 ## Notes
 
-- The current sender uses generated test frames, not live system audio yet.
+- Windows sender mode now captures real system audio from the default render endpoint.
+- Linux sender mode now captures system audio through a monitor source using `parec`. It can use `VELIN_LINUX_MONITOR` to override the detected monitor source when needed.
 - The current receiver can play generated test frames on a selected output device.
 - Linux is part of the project target, but the current prototype work has primarily been exercised on Windows.
 - Receiver mode can bind to `Automatic` (`0.0.0.0`) or a specific local IPv4 address.
 - Receiver discovery currently uses local-network UDP broadcast announcements.
 - The current TCP handshake is minimal and unencrypted. Encryption and trusted pairing are future work.
 - Receiver playback currently uses the selected device's default output config. Sample-rate conversion is not implemented yet.
+- Windows capture currently expects the default system mix format to be `48 kHz`.
+- Linux capture currently expects `parec` plus PulseAudio/PipeWire pulse compatibility to be available, and it also runs at `48 kHz`.
 
 ---
 

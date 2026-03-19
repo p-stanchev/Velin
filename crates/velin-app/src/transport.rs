@@ -1,8 +1,8 @@
 use crate::audio::open_output_device;
+use crate::capture::start_system_audio_capture;
 use anyhow::{Context, Result, bail};
 use local_ip_address::list_afinet_netifas;
 use std::env;
-use std::f32::consts::TAU;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,8 +11,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
-    Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, FRAME_SAMPLES,
-    Hello, SAMPLE_RATE_HZ,
+    Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, Hello,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -140,9 +139,15 @@ pub async fn run_source(
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
     };
 
+    let mut capture = start_system_audio_capture().context("failed to start system audio capture")?;
+    status(format!(
+        "Capturing system audio at {} Hz.",
+        capture.sample_rate_hz()
+    ));
+
     let hello = Hello {
         source_name: host_name(),
-        sample_rate_hz: SAMPLE_RATE_HZ,
+        sample_rate_hz: capture.sample_rate_hz(),
         channels: CHANNELS,
     };
     write_json_message(&mut stream, &hello).await?;
@@ -162,31 +167,18 @@ pub async fn run_source(
         .with_context(|| format!("failed to connect audio socket to {audio_addr}"))?;
 
     status(format!("Connected to receiver {}.", accept.target_name));
-
-    let mut ticker = time::interval(frame_duration());
-    let mut phase = 0.0_f32;
-    let step = 440.0_f32 / SAMPLE_RATE_HZ as f32;
     let mute_rx = mute_rx;
 
     for sequence in 0_u64.. {
-        tokio::select! {
-            _ = ticker.tick() => {}
+        let Some(mut samples) = (tokio::select! {
+            chunk = capture.recv() => chunk,
             _ = wait_for_stop(&mut stop_rx) => return Ok(()),
-        }
+        }) else {
+            bail!("system audio capture ended unexpectedly");
+        };
 
-        let mut samples = Vec::with_capacity(FRAME_SAMPLES * CHANNELS as usize);
-        let muted = *mute_rx.borrow();
-        for _ in 0..FRAME_SAMPLES {
-            let pcm = if muted {
-                0
-            } else {
-                let sample = (phase * TAU).sin();
-                (sample * i16::MAX as f32 * 0.2) as i16
-            };
-            for _ in 0..CHANNELS {
-                samples.push(pcm);
-            }
-            phase = (phase + step) % 1.0;
+        if *mute_rx.borrow() {
+            samples.fill(0);
         }
 
         let frame = AudioFrame { sequence, samples };
@@ -254,10 +246,6 @@ async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
             return;
         }
     }
-}
-
-fn frame_duration() -> Duration {
-    Duration::from_secs_f64(FRAME_SAMPLES as f64 / SAMPLE_RATE_HZ as f64)
 }
 
 async fn write_json_message<T>(stream: &mut TcpStream, value: &T) -> Result<()>
