@@ -3,6 +3,7 @@ use crate::capture::start_system_audio_capture;
 use anyhow::{Context, Result, bail};
 use local_ip_address::list_afinet_netifas;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -17,8 +18,10 @@ use velin_proto::{
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
-const JITTER_BUFFER_TARGET_FRAMES: usize = 6;
-const JITTER_BUFFER_MAX_FRAMES: usize = 24;
+const JITTER_BUFFER_TARGET_FRAMES: usize = 12;
+const JITTER_BUFFER_MAX_FRAMES: usize = 96;
+const PLAYBACK_QUEUE_LOW_WATER_FRAMES: usize = 6;
+const PLAYBACK_QUEUE_TARGET_FRAMES: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -95,7 +98,7 @@ pub async fn run_target(
     let mut packet = vec![0_u8; 2048];
     let mut received_frames = 0_u64;
     let started = Instant::now();
-    let mut playback_tick = time::interval(frame_duration());
+    let mut playback_tick = time::interval(Duration::from_millis(2));
     playback_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut buffered_frames = BTreeMap::<u64, Vec<i16>>::new();
     let mut next_play_sequence = None;
@@ -151,21 +154,50 @@ pub async fn run_target(
                     continue;
                 }
 
-                let play_sequence = next_play_sequence.get_or_insert(0);
-                if let Some(samples) = buffered_frames.remove(play_sequence) {
-                    player.push_samples(&samples);
-                } else {
-                    underrun_frames += 1;
-                    player.push_samples(&silence_frame);
-                }
-                *play_sequence += 1;
-                played_frames += 1;
+                let low_water_samples = PLAYBACK_QUEUE_LOW_WATER_FRAMES * FRAME_SAMPLES * CHANNELS as usize;
+                let target_samples = PLAYBACK_QUEUE_TARGET_FRAMES * FRAME_SAMPLES * CHANNELS as usize;
 
-                if played_frames == 1 || played_frames % 100 == 0 {
+                if player.buffered_sample_count() > low_water_samples {
+                    continue;
+                }
+
+                let play_sequence = next_play_sequence.get_or_insert(0);
+                let mut queued_any = false;
+
+                while player.buffered_sample_count() < target_samples {
+                    if let Some(samples) = buffered_frames.remove(play_sequence) {
+                        player.push_samples(&samples);
+                    } else if let Some((&first_available, _)) = buffered_frames.first_key_value() {
+                        if first_available > *play_sequence {
+                            underrun_frames += 1;
+                            player.push_samples(&silence_frame);
+                        } else {
+                            break;
+                        }
+                    } else {
+                        jitter_primed = false;
+                        break;
+                    }
+
+                    *play_sequence += 1;
+                    played_frames += 1;
+                    queued_any = true;
+                }
+
+                if !jitter_primed && buffered_frames.len() >= JITTER_BUFFER_TARGET_FRAMES {
+                    if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
+                        next_play_sequence = Some(first_sequence);
+                    }
+                    jitter_primed = true;
+                    status(format!("Jitter buffer refilled with {} frames.", buffered_frames.len()));
+                }
+
+                if queued_any && (played_frames == 1 || played_frames % 100 == 0) {
                     let seconds = started.elapsed().as_secs_f32();
                     status(format!(
-                        "Received {received_frames} frames, played {played_frames}, underruns {underrun_frames}, dropped {dropped_frames}, buffer {} in {seconds:.1}s.",
-                        buffered_frames.len()
+                        "Received {received_frames} frames, played {played_frames}, underruns {underrun_frames}, dropped {dropped_frames}, net buffer {}, audio queue {} in {seconds:.1}s.",
+                        buffered_frames.len(),
+                        player.buffered_sample_count() / (FRAME_SAMPLES * CHANNELS as usize)
                     ));
                 }
             }
@@ -225,8 +257,11 @@ pub async fn run_source(
 
     status(format!("Connected to receiver {}.", accept.target_name));
     let mute_rx = mute_rx;
+    let mut pending_samples = VecDeque::<i16>::new();
+    let frame_sample_count = FRAME_SAMPLES * CHANNELS as usize;
+    let mut sequence = 0_u64;
 
-    for sequence in 0_u64.. {
+    loop {
         let Some(mut samples) = (tokio::select! {
             chunk = capture.recv() => chunk,
             result = poll_control_channel(&mut control_read) => match result? {
@@ -245,19 +280,35 @@ pub async fn run_source(
             samples.fill(0);
         }
 
-        let frame = AudioFrame { sequence, samples };
-        let encoded = frame.encode();
-        let sent = tokio::select! {
-            result = audio_socket.send(&encoded) => result.context("failed to send audio frame")?,
-            _ = wait_for_stop(&mut stop_rx) => return Ok(()),
-        };
+        pending_samples.extend(samples);
 
-        if sent != encoded.len() {
-            bail!("short UDP send: expected {}, sent {sent}", encoded.len());
-        }
+        while pending_samples.len() >= frame_sample_count {
+            let mut frame_samples = Vec::with_capacity(frame_sample_count);
+            for _ in 0..frame_sample_count {
+                if let Some(sample) = pending_samples.pop_front() {
+                    frame_samples.push(sample);
+                }
+            }
 
-        if sequence == 0 || sequence % 100 == 0 {
-            status(format!("Sent frame {sequence}."));
+            let frame = AudioFrame {
+                sequence,
+                samples: frame_samples,
+            };
+            let encoded = frame.encode();
+            let sent = tokio::select! {
+                result = audio_socket.send(&encoded) => result.context("failed to send audio frame")?,
+                _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+            };
+
+            if sent != encoded.len() {
+                bail!("short UDP send: expected {}, sent {sent}", encoded.len());
+            }
+
+            if sequence == 0 || sequence % 100 == 0 {
+                status(format!("Sent frame {sequence}."));
+            }
+
+            sequence += 1;
         }
     }
 
@@ -299,10 +350,6 @@ async fn run_discovery_broadcaster(
             _ = wait_for_stop(stop_rx) => return Ok(()),
         }
     }
-}
-
-fn frame_duration() -> Duration {
-    Duration::from_secs_f64(FRAME_SAMPLES as f64 / 48_000_f64)
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {

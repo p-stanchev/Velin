@@ -43,6 +43,14 @@ impl OutputPlayer {
     pub fn config_summary(&self) -> &str {
         &self.config_summary
     }
+
+    pub fn buffered_sample_count(&self) -> usize {
+        self.buffer
+            .lock()
+            .expect("playback buffer poisoned")
+            .samples
+            .len()
+    }
 }
 
 pub fn output_device_names() -> Result<Vec<String>> {
