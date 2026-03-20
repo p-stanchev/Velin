@@ -61,6 +61,14 @@ impl OutputPlayer {
     pub fn channel_count(&self) -> usize {
         self.channel_count
     }
+
+    pub fn clear_buffer(&self) {
+        self.buffer
+            .lock()
+            .expect("playback buffer poisoned")
+            .samples
+            .clear();
+    }
 }
 
 pub fn output_device_names() -> Result<Vec<String>> {

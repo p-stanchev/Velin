@@ -19,9 +19,10 @@ use velin_proto::{
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 6;
-const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 10;
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 12;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
-const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 32;
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 40;
+const CONSECUTIVE_MISSING_REBUFFER_THRESHOLD: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -217,6 +218,18 @@ pub async fn run_target(
                                 jitter_target_frames = (jitter_target_frames + 2).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
                             }
                             stable_played_frames = 0;
+
+                            if consecutive_missing_frames >= CONSECUTIVE_MISSING_REBUFFER_THRESHOLD {
+                                player.clear_buffer();
+                                jitter_primed = false;
+                                consecutive_missing_frames = 0;
+                                next_play_sequence = buffered_frames.first_key_value().map(|(&sequence, _)| sequence);
+                                status(format!(
+                                    "Receiver rebuffering after packet loss. New target {} frames.",
+                                    jitter_target_frames
+                                ));
+                                break;
+                            }
                         } else {
                             break;
                         }
