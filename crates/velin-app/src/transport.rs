@@ -14,14 +14,14 @@ use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
     Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
-    FRAME_SAMPLES, Hello,
+    Hello,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
-const JITTER_BUFFER_TARGET_FRAMES: usize = 12;
+const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 4;
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 6;
 const JITTER_BUFFER_MAX_FRAMES: usize = 96;
-const PLAYBACK_QUEUE_LOW_WATER_FRAMES: usize = 6;
-const PLAYBACK_QUEUE_TARGET_FRAMES: usize = 12;
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -95,6 +95,7 @@ pub async fn run_target(
     };
     write_json_message(&mut stream, &accept).await?;
 
+    let output_frame_samples = frame_sample_count(player.sample_rate_hz());
     let mut packet = vec![0_u8; 2048];
     let mut received_frames = 0_u64;
     let started = Instant::now();
@@ -103,10 +104,19 @@ pub async fn run_target(
     let mut buffered_frames = BTreeMap::<u64, Vec<i16>>::new();
     let mut next_play_sequence = None;
     let mut jitter_primed = false;
-    let silence_frame = vec![0_i16; FRAME_SAMPLES * CHANNELS as usize];
+    let silence_frame = vec![0_i16; output_frame_samples];
     let mut played_frames = 0_u64;
     let mut dropped_frames = 0_u64;
     let mut underrun_frames = 0_u64;
+    let mut late_packets = 0_u64;
+    let mut reordered_packets = 0_u64;
+    let mut missing_packets = 0_u64;
+    let mut highest_received_sequence = None;
+    let mut jitter_target_frames = JITTER_BUFFER_DEFAULT_TARGET_FRAMES;
+    let mut stable_played_frames = 0_u64;
+    let mut depth_samples = 0_u64;
+    let mut depth_sum = 0_u64;
+    let mut last_good_output = silence_frame.clone();
 
     loop {
         tokio::select! {
@@ -124,13 +134,33 @@ pub async fn run_target(
                 }
 
                 if let Some(play_sequence) = next_play_sequence {
+                    if frame.sequence < play_sequence {
+                        late_packets += 1;
+                        continue;
+                    }
+                }
+
+                if let Some(highest) = highest_received_sequence {
+                    if frame.sequence < highest {
+                        reordered_packets += 1;
+                    }
+                }
+                highest_received_sequence = Some(highest_received_sequence.map_or(frame.sequence, |value| value.max(frame.sequence)));
+
+                if let Some(play_sequence) = next_play_sequence {
                     if frame.sequence + JITTER_BUFFER_MAX_FRAMES as u64 <= play_sequence {
                         dropped_frames += 1;
                         continue;
                     }
                 }
 
-                buffered_frames.entry(frame.sequence).or_insert(frame.samples);
+                let resampled = resample_stereo_i16(
+                    &frame.samples,
+                    hello.sample_rate_hz,
+                    player.sample_rate_hz(),
+                    player.channel_count(),
+                );
+                buffered_frames.entry(frame.sequence).or_insert(resampled);
 
                 while buffered_frames.len() > JITTER_BUFFER_MAX_FRAMES {
                     if let Some((&oldest, _)) = buffered_frames.first_key_value() {
@@ -141,21 +171,24 @@ pub async fn run_target(
                     }
                 }
 
-                if !jitter_primed && buffered_frames.len() >= JITTER_BUFFER_TARGET_FRAMES {
+                if !jitter_primed && buffered_frames.len() >= jitter_target_frames {
                     if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
                         next_play_sequence = Some(first_sequence);
                     }
                     jitter_primed = true;
                     status(format!("Jitter buffer primed with {} frames.", buffered_frames.len()));
                 }
+
+                depth_sum += buffered_frames.len() as u64;
+                depth_samples += 1;
             }
             _ = playback_tick.tick() => {
                 if !jitter_primed {
                     continue;
                 }
 
-                let low_water_samples = PLAYBACK_QUEUE_LOW_WATER_FRAMES * FRAME_SAMPLES * CHANNELS as usize;
-                let target_samples = PLAYBACK_QUEUE_TARGET_FRAMES * FRAME_SAMPLES * CHANNELS as usize;
+                let low_water_samples = (jitter_target_frames.max(2) / 2).max(2) * output_frame_samples;
+                let target_samples = jitter_target_frames * output_frame_samples;
 
                 if player.buffered_sample_count() > low_water_samples {
                     continue;
@@ -166,11 +199,17 @@ pub async fn run_target(
 
                 while player.buffered_sample_count() < target_samples {
                     if let Some(samples) = buffered_frames.remove(play_sequence) {
+                        last_good_output.clone_from(&samples);
                         player.push_samples(&samples);
                     } else if let Some((&first_available, _)) = buffered_frames.first_key_value() {
                         if first_available > *play_sequence {
+                            missing_packets += 1;
                             underrun_frames += 1;
-                            player.push_samples(&silence_frame);
+                            player.push_samples(&last_good_output);
+                            if jitter_target_frames < JITTER_BUFFER_MAX_TARGET_FRAMES {
+                                jitter_target_frames = (jitter_target_frames + 2).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
+                            }
+                            stable_played_frames = 0;
                         } else {
                             break;
                         }
@@ -184,7 +223,7 @@ pub async fn run_target(
                     queued_any = true;
                 }
 
-                if !jitter_primed && buffered_frames.len() >= JITTER_BUFFER_TARGET_FRAMES {
+                if !jitter_primed && buffered_frames.len() >= jitter_target_frames {
                     if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
                         next_play_sequence = Some(first_sequence);
                     }
@@ -192,12 +231,28 @@ pub async fn run_target(
                     status(format!("Jitter buffer refilled with {} frames.", buffered_frames.len()));
                 }
 
+                if queued_any {
+                    stable_played_frames += 1;
+                    if stable_played_frames >= 400
+                        && jitter_target_frames > JITTER_BUFFER_MIN_TARGET_FRAMES
+                        && buffered_frames.len() >= jitter_target_frames
+                    {
+                        jitter_target_frames -= 1;
+                        stable_played_frames = 0;
+                    }
+                }
+
                 if queued_any && (played_frames == 1 || played_frames % 100 == 0) {
                     let seconds = started.elapsed().as_secs_f32();
+                    let average_depth = if depth_samples == 0 {
+                        0.0
+                    } else {
+                        depth_sum as f32 / depth_samples as f32
+                    };
                     status(format!(
-                        "Received {received_frames} frames, played {played_frames}, underruns {underrun_frames}, dropped {dropped_frames}, net buffer {}, audio queue {} in {seconds:.1}s.",
+                        "Received {received_frames} frames, played {played_frames}, late {late_packets}, reordered {reordered_packets}, missing {missing_packets}, underruns {underrun_frames}, dropped {dropped_frames}, target {jitter_target_frames}, avg buffer {average_depth:.1}, net buffer {}, audio queue {} in {seconds:.1}s.",
                         buffered_frames.len(),
-                        player.buffered_sample_count() / (FRAME_SAMPLES * CHANNELS as usize)
+                        player.buffered_sample_count() / output_frame_samples
                     ));
                 }
             }
@@ -258,8 +313,9 @@ pub async fn run_source(
     status(format!("Connected to receiver {}.", accept.target_name));
     let mute_rx = mute_rx;
     let mut pending_samples = VecDeque::<i16>::new();
-    let frame_sample_count = FRAME_SAMPLES * CHANNELS as usize;
+    let frame_sample_count = frame_sample_count(capture.sample_rate_hz());
     let mut sequence = 0_u64;
+    let send_start = time::Instant::now();
 
     loop {
         let Some(mut samples) = (tokio::select! {
@@ -295,6 +351,13 @@ pub async fn run_source(
                 samples: frame_samples,
             };
             let encoded = frame.encode();
+            let scheduled_send = send_start + frame_duration_for(sequence, capture.sample_rate_hz());
+            if scheduled_send > time::Instant::now() {
+                tokio::select! {
+                    _ = time::sleep_until(scheduled_send) => {}
+                    _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+                }
+            }
             let sent = tokio::select! {
                 result = audio_socket.send(&encoded) => result.context("failed to send audio frame")?,
                 _ = wait_for_stop(&mut stop_rx) => return Ok(()),
@@ -350,6 +413,73 @@ async fn run_discovery_broadcaster(
             _ = wait_for_stop(stop_rx) => return Ok(()),
         }
     }
+}
+
+fn frame_duration_for(sequence: u64, sample_rate_hz: u32) -> Duration {
+    let samples_per_channel = samples_per_10ms(sample_rate_hz) as f64;
+    let seconds = (sequence as f64 * samples_per_channel) / sample_rate_hz as f64;
+    Duration::from_secs_f64(seconds)
+}
+
+fn samples_per_10ms(sample_rate_hz: u32) -> usize {
+    ((sample_rate_hz as u64 * 10) / 1000) as usize
+}
+
+fn frame_sample_count(sample_rate_hz: u32) -> usize {
+    samples_per_10ms(sample_rate_hz) * CHANNELS as usize
+}
+
+fn resample_stereo_i16(
+    input: &[i16],
+    input_rate_hz: u32,
+    output_rate_hz: u32,
+    output_channels: usize,
+) -> Vec<i16> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let input_channels = CHANNELS as usize;
+    let input_frames = input.len() / input_channels;
+    if input_frames == 0 {
+        return Vec::new();
+    }
+
+    let output_frames = ((input_frames as u64 * output_rate_hz as u64) / input_rate_hz as u64)
+        .max(1) as usize;
+
+    let mut output = Vec::with_capacity(output_frames * output_channels.max(1));
+    let ratio = input_rate_hz as f32 / output_rate_hz as f32;
+
+    for out_index in 0..output_frames {
+        let position = out_index as f32 * ratio;
+        let left_index = position.floor() as usize;
+        let right_index = left_index.min(input_frames.saturating_sub(1));
+        let next_index = (right_index + 1).min(input_frames.saturating_sub(1));
+        let frac = position - left_index as f32;
+
+        let left_a = input[right_index * input_channels] as f32;
+        let right_a = input[right_index * input_channels + 1] as f32;
+        let left_b = input[next_index * input_channels] as f32;
+        let right_b = input[next_index * input_channels + 1] as f32;
+
+        let left = (left_a + (left_b - left_a) * frac).round() as i16;
+        let right = (right_a + (right_b - right_a) * frac).round() as i16;
+
+        match output_channels {
+            0 => {}
+            1 => output.push(((left as i32 + right as i32) / 2) as i16),
+            _ => {
+                output.push(left);
+                output.push(right);
+                for extra_channel in 2..output_channels {
+                    output.push(if extra_channel % 2 == 0 { left } else { right });
+                }
+            }
+        }
+    }
+
+    output
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {

@@ -21,6 +21,8 @@ pub struct OutputPlayer {
     buffer: Arc<Mutex<PlaybackBuffer>>,
     muted: Arc<AtomicBool>,
     config_summary: String,
+    sample_rate_hz: u32,
+    channel_count: usize,
 }
 
 impl OutputPlayer {
@@ -50,6 +52,14 @@ impl OutputPlayer {
             .expect("playback buffer poisoned")
             .samples
             .len()
+    }
+
+    pub fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.channel_count
     }
 }
 
@@ -81,14 +91,53 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
     let output_channels = stream_config.channels as usize;
     let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
     let muted = Arc::new(AtomicBool::new(false));
-    let stream = build_stream(
+    let (stream, config_summary, sample_rate_hz, channel_count) = match build_stream(
         &device,
         &stream_config,
         sample_format,
         output_channels,
         Arc::clone(&buffer),
         Arc::clone(&muted),
-    )?;
+    ) {
+        Ok(stream) => (
+            stream,
+            format!(
+                "{} Hz, {} ch, {:?}, {:?}",
+                stream_config.sample_rate,
+                stream_config.channels,
+                sample_format,
+                stream_config.buffer_size
+            ),
+            stream_config.sample_rate,
+            stream_config.channels as usize,
+        ),
+        Err(primary_error) => {
+            let fallback_config = supported_config.config();
+            let fallback_channels = fallback_config.channels as usize;
+            let fallback_stream = build_stream(
+                &device,
+                &fallback_config,
+                sample_format,
+                fallback_channels,
+                Arc::clone(&buffer),
+                Arc::clone(&muted),
+            )
+            .with_context(|| format!("failed to build output stream with tuned config: {primary_error:#}"))?;
+
+            (
+                fallback_stream,
+                format!(
+                    "{} Hz, {} ch, {:?}, {:?} (fallback)",
+                    fallback_config.sample_rate,
+                    fallback_config.channels,
+                    sample_format,
+                    fallback_config.buffer_size
+                ),
+                fallback_config.sample_rate,
+                fallback_config.channels as usize,
+            )
+        }
+    };
 
     stream.play().context("failed to start output stream")?;
 
@@ -97,13 +146,9 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
             _stream: stream,
             buffer,
             muted,
-            config_summary: format!(
-                "{} Hz, {} ch, {:?}, {:?}",
-                stream_config.sample_rate,
-                stream_config.channels,
-                sample_format,
-                stream_config.buffer_size
-            ),
+            config_summary,
+            sample_rate_hz,
+            channel_count,
         },
         device_name,
     ))
@@ -154,7 +199,7 @@ fn stream_config_for_playback(supported_config: &SupportedStreamConfig) -> Strea
 
 #[cfg(target_os = "linux")]
 fn choose_linux_buffer_size(buffer_size: &SupportedBufferSize) -> BufferSize {
-    const TARGET_FRAMES: u32 = 4096;
+    const TARGET_FRAMES: u32 = 8192;
 
     match buffer_size {
         SupportedBufferSize::Range { min, max } => BufferSize::Fixed(TARGET_FRAMES.clamp(*min, *max)),

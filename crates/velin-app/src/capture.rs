@@ -1,6 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use tokio::sync::mpsc;
-use velin_proto::SAMPLE_RATE_HZ;
 
 pub struct SystemAudioCapture {
     sample_rate_hz: u32,
@@ -20,13 +19,6 @@ impl SystemAudioCapture {
 
 pub fn start_system_audio_capture() -> Result<SystemAudioCapture> {
     let (sample_rate_hz, receiver, inner) = platform::start_capture()?;
-    if sample_rate_hz != SAMPLE_RATE_HZ {
-        bail!(
-            "default system output is {} Hz, but the sender currently requires {} Hz capture",
-            sample_rate_hz,
-            SAMPLE_RATE_HZ
-        );
-    }
 
     Ok(SystemAudioCapture {
         sample_rate_hz,
