@@ -200,8 +200,24 @@ cargo run -p velin-app -- connect 127.0.0.1
 | Platform | Requirements |
 | --- | --- |
 | Windows | Rust toolchain |
-| Linux | Rust toolchain |
+| Linux | Rust toolchain, `parec`, and PulseAudio or PipeWire pulse compatibility |
 | Both | `cargo`, `git`, and two machines on the same local network if you want a real network test |
+
+### Windows Firewall
+
+When the receiver runs on Windows, inbound firewall rules may be required before another machine can connect.
+
+- TCP `49000` for the control channel
+- UDP `49001` for audio frames
+- UDP `49002` for discovery
+
+Example PowerShell commands:
+
+```powershell
+New-NetFirewallRule -DisplayName "Velin TCP 49000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 49000
+New-NetFirewallRule -DisplayName "Velin UDP 49001" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 49001
+New-NetFirewallRule -DisplayName "Velin UDP 49002" -Direction Inbound -Action Allow -Protocol UDP -LocalPort 49002
+```
 
 ---
 
@@ -217,6 +233,12 @@ cargo run -p velin-app -- connect 127.0.0.1
 - Receiver playback currently uses the selected device's default output config. Sample-rate conversion is not implemented yet.
 - Windows capture currently expects the default system mix format to be `48 kHz`.
 - Linux capture currently expects `parec` plus PulseAudio/PipeWire pulse compatibility to be available, and it also runs at `48 kHz`.
+
+## Troubleshooting
+
+- If Linux cannot connect to a Windows receiver and TCP `49000` times out, check Windows Defender Firewall first.
+- If receiver discovery does not find a peer, use the `Refresh` action in sender mode or enter the receiver IP manually.
+- If Linux playback is choppy, the current prototype is still missing a real jitter buffer, resampling, and richer receiver-side timing recovery.
 
 ---
 

@@ -2,6 +2,7 @@ use crate::audio::open_output_device;
 use crate::capture::start_system_audio_capture;
 use anyhow::{Context, Result, bail};
 use local_ip_address::list_afinet_netifas;
+use std::collections::BTreeMap;
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -12,10 +13,12 @@ use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
     Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
-    Hello,
+    FRAME_SAMPLES, Hello,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
+const JITTER_BUFFER_TARGET_FRAMES: usize = 6;
+const JITTER_BUFFER_MAX_FRAMES: usize = 24;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -91,40 +94,87 @@ pub async fn run_target(
 
     let mut packet = vec![0_u8; 2048];
     let mut received_frames = 0_u64;
-    let mut last_sequence = None;
     let started = Instant::now();
+    let mut playback_tick = time::interval(frame_duration());
+    playback_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut buffered_frames = BTreeMap::<u64, Vec<i16>>::new();
+    let mut next_play_sequence = None;
+    let mut jitter_primed = false;
+    let silence_frame = vec![0_i16; FRAME_SAMPLES * CHANNELS as usize];
+    let mut played_frames = 0_u64;
+    let mut dropped_frames = 0_u64;
+    let mut underrun_frames = 0_u64;
 
     loop {
-        let (len, from) = tokio::select! {
-            result = audio_socket.recv_from(&mut packet) => result.context("failed to receive audio frame")?,
+        tokio::select! {
+            result = audio_socket.recv_from(&mut packet) => {
+                let (len, from) = result.context("failed to receive audio frame")?;
+
+                let Some(frame) = AudioFrame::decode(&packet[..len]) else {
+                    status(format!("Discarded malformed packet from {from}."));
+                    continue;
+                };
+
+                received_frames += 1;
+                if next_play_sequence.is_none() {
+                    next_play_sequence = Some(frame.sequence);
+                }
+
+                if let Some(play_sequence) = next_play_sequence {
+                    if frame.sequence + JITTER_BUFFER_MAX_FRAMES as u64 <= play_sequence {
+                        dropped_frames += 1;
+                        continue;
+                    }
+                }
+
+                buffered_frames.entry(frame.sequence).or_insert(frame.samples);
+
+                while buffered_frames.len() > JITTER_BUFFER_MAX_FRAMES {
+                    if let Some((&oldest, _)) = buffered_frames.first_key_value() {
+                        buffered_frames.remove(&oldest);
+                        dropped_frames += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if !jitter_primed && buffered_frames.len() >= JITTER_BUFFER_TARGET_FRAMES {
+                    if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
+                        next_play_sequence = Some(first_sequence);
+                    }
+                    jitter_primed = true;
+                    status(format!("Jitter buffer primed with {} frames.", buffered_frames.len()));
+                }
+            }
+            _ = playback_tick.tick() => {
+                if !jitter_primed {
+                    continue;
+                }
+
+                let play_sequence = next_play_sequence.get_or_insert(0);
+                if let Some(samples) = buffered_frames.remove(play_sequence) {
+                    player.push_samples(&samples);
+                } else {
+                    underrun_frames += 1;
+                    player.push_samples(&silence_frame);
+                }
+                *play_sequence += 1;
+                played_frames += 1;
+
+                if played_frames == 1 || played_frames % 100 == 0 {
+                    let seconds = started.elapsed().as_secs_f32();
+                    status(format!(
+                        "Received {received_frames} frames, played {played_frames}, underruns {underrun_frames}, dropped {dropped_frames}, buffer {} in {seconds:.1}s.",
+                        buffered_frames.len()
+                    ));
+                }
+            }
             result = mute_rx.changed() => {
                 if result.is_ok() {
                     player.set_muted(*mute_rx.borrow());
                 }
-                continue;
             }
             _ = wait_for_stop(&mut stop_rx) => return Ok(()),
-        };
-
-        let Some(frame) = AudioFrame::decode(&packet[..len]) else {
-            status(format!("Discarded malformed packet from {from}."));
-            continue;
-        };
-
-        if let Some(previous) = last_sequence {
-            let expected = previous + 1;
-            if frame.sequence != expected {
-                status(format!("Frame gap: expected {expected}, got {}.", frame.sequence));
-            }
-        }
-
-        last_sequence = Some(frame.sequence);
-        received_frames += 1;
-        player.push_samples(&frame.samples);
-
-        if received_frames == 1 || received_frames % 100 == 0 {
-            let seconds = started.elapsed().as_secs_f32();
-            status(format!("Received {received_frames} frames in {seconds:.1}s."));
         }
     }
 }
@@ -249,6 +299,10 @@ async fn run_discovery_broadcaster(
             _ = wait_for_stop(stop_rx) => return Ok(()),
         }
     }
+}
+
+fn frame_duration() -> Duration {
+    Duration::from_secs_f64(FRAME_SAMPLES as f64 / 48_000_f64)
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<bool>) {
