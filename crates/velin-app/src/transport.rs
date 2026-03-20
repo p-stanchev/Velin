@@ -18,10 +18,10 @@ use velin_proto::{
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
-const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 4;
-const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 6;
-const JITTER_BUFFER_MAX_FRAMES: usize = 96;
-const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 20;
+const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 6;
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 10;
+const JITTER_BUFFER_MAX_FRAMES: usize = 160;
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -117,6 +117,7 @@ pub async fn run_target(
     let mut depth_samples = 0_u64;
     let mut depth_sum = 0_u64;
     let mut last_good_output = silence_frame.clone();
+    let mut consecutive_missing_frames = 0_u64;
 
     loop {
         tokio::select! {
@@ -201,11 +202,17 @@ pub async fn run_target(
                     if let Some(samples) = buffered_frames.remove(play_sequence) {
                         last_good_output.clone_from(&samples);
                         player.push_samples(&samples);
+                        consecutive_missing_frames = 0;
                     } else if let Some((&first_available, _)) = buffered_frames.first_key_value() {
                         if first_available > *play_sequence {
                             missing_packets += 1;
                             underrun_frames += 1;
-                            player.push_samples(&last_good_output);
+                            consecutive_missing_frames += 1;
+                            if consecutive_missing_frames <= 2 {
+                                player.push_samples(&last_good_output);
+                            } else {
+                                player.push_samples(&silence_frame);
+                            }
                             if jitter_target_frames < JITTER_BUFFER_MAX_TARGET_FRAMES {
                                 jitter_target_frames = (jitter_target_frames + 2).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
                             }
@@ -215,6 +222,7 @@ pub async fn run_target(
                         }
                     } else {
                         jitter_primed = false;
+                        consecutive_missing_frames = 0;
                         break;
                     }
 
