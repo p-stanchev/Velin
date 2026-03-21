@@ -20,11 +20,27 @@ use velin_proto::{
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 pub type MetricsSink = Arc<dyn Fn(String) + Send + Sync>;
 const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 2;
-const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 4;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
-const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 12;
 const CONSECUTIVE_MISSING_REBUFFER_THRESHOLD: u64 = 4;
+
+#[cfg(target_os = "linux")]
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 6;
+#[cfg(not(target_os = "linux"))]
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 4;
+
+#[cfg(target_os = "linux")]
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 16;
+#[cfg(not(target_os = "linux"))]
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 12;
+
+#[cfg(target_os = "linux")]
+const PLAYBACK_QUEUE_TARGET_FRAMES: usize = 6;
+#[cfg(not(target_os = "linux"))]
 const PLAYBACK_QUEUE_TARGET_FRAMES: usize = 3;
+
+#[cfg(target_os = "linux")]
+const PLAYBACK_QUEUE_LOW_WATER_FRAMES: usize = 3;
+#[cfg(not(target_os = "linux"))]
 const PLAYBACK_QUEUE_LOW_WATER_FRAMES: usize = 1;
 
 #[derive(Debug, Clone)]
