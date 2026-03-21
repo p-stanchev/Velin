@@ -213,7 +213,7 @@ fn start_microphone_capture(
 
 struct MicrophoneBuffer {
     sender: mpsc::UnboundedSender<Vec<i16>>,
-    mono_samples: Vec<f32>,
+    mono_samples: VecDeque<f32>,
     chunk_frames: usize,
     channels: usize,
 }
@@ -222,7 +222,7 @@ impl MicrophoneBuffer {
     fn new(sample_rate_hz: u32, channels: usize, sender: mpsc::UnboundedSender<Vec<i16>>) -> Self {
         Self {
             sender,
-            mono_samples: Vec::new(),
+            mono_samples: VecDeque::new(),
             chunk_frames: ((sample_rate_hz as u64 * 10) / 1000) as usize,
             channels: channels.max(1),
         }
@@ -238,15 +238,21 @@ impl MicrophoneBuffer {
             for sample in frame {
                 sum += sample.to_sample::<f32>();
             }
-            self.mono_samples.push(sum / frame.len().max(1) as f32);
+            self.mono_samples.push_back(sum / frame.len().max(1) as f32);
         }
 
         while self.mono_samples.len() >= self.chunk_frames {
             let mut chunk = Vec::with_capacity(self.chunk_frames * CHANNELS as usize);
-            for sample in self.mono_samples.drain(0..self.chunk_frames) {
+            for _ in 0..self.chunk_frames {
+                let Some(sample) = self.mono_samples.pop_front() else {
+                    break;
+                };
                 let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                 chunk.push(pcm);
                 chunk.push(pcm);
+            }
+            if chunk.len() != self.chunk_frames * CHANNELS as usize {
+                break;
             }
             if self.sender.send(chunk).is_err() {
                 break;

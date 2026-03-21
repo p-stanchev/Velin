@@ -1034,9 +1034,18 @@ fn next_receiver_stream_samples(
             return None;
         }
     } else {
-        stream.jitter_primed = false;
-        stream.consecutive_missing_frames = 0;
-        return None;
+        stream.underrun_frames += 1;
+        stream.consecutive_missing_frames += 1;
+        if stream.consecutive_missing_frames >= CONSECUTIVE_MISSING_REBUFFER_THRESHOLD {
+            stream.jitter_primed = false;
+            stream.consecutive_missing_frames = 0;
+            return None;
+        }
+        if stream.consecutive_missing_frames <= 2 && !stream.last_good_output.is_empty() {
+            stream.last_good_output.clone()
+        } else {
+            vec![0_i16; output_frame_samples]
+        }
     };
 
     *play_sequence += 1;
