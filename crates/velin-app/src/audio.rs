@@ -22,7 +22,6 @@ pub struct OutputPlayer {
     muted: Arc<AtomicBool>,
     config_summary: String,
     sample_rate_hz: u32,
-    channel_count: usize,
 }
 
 impl OutputPlayer {
@@ -56,10 +55,6 @@ impl OutputPlayer {
 
     pub fn sample_rate_hz(&self) -> u32 {
         self.sample_rate_hz
-    }
-
-    pub fn channel_count(&self) -> usize {
-        self.channel_count
     }
 
     pub fn clear_buffer(&self) {
@@ -99,7 +94,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
     let output_channels = stream_config.channels as usize;
     let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
     let muted = Arc::new(AtomicBool::new(false));
-    let (stream, config_summary, sample_rate_hz, channel_count) = match build_stream(
+    let (stream, config_summary, sample_rate_hz) = match build_stream(
         &device,
         &stream_config,
         sample_format,
@@ -117,7 +112,6 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
                 stream_config.buffer_size
             ),
             stream_config.sample_rate,
-            stream_config.channels as usize,
         ),
         Err(primary_error) => {
             let fallback_config = supported_config.config();
@@ -142,7 +136,6 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
                     fallback_config.buffer_size
                 ),
                 fallback_config.sample_rate,
-                fallback_config.channels as usize,
             )
         }
     };
@@ -156,7 +149,6 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
             muted,
             config_summary,
             sample_rate_hz,
-            channel_count,
         },
         device_name,
     ))
