@@ -396,7 +396,7 @@ type PlatformCapture = platform::UnsupportedCapture;
 #[cfg(target_os = "linux")]
 mod platform {
     use anyhow::{Context, Result, anyhow};
-    use crate::LinuxPulseCapture;
+    use crate::capture::LinuxPulseCapture;
     use std::env;
     use std::io::Read;
     use std::process::{Child, Command, Stdio};
