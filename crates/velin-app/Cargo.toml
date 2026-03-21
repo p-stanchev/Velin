@@ -3,6 +3,11 @@ name = "velin-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors = ["p-stanchev"]
+description = "LAN audio routing beta for Windows and Linux"
+homepage = "https://github.com/p-stanchev/velin"
+repository = "https://github.com/p-stanchev/velin"
+readme = "../../README.md"
 
 [dependencies]
 anyhow.workspace = true
@@ -22,3 +27,12 @@ x25519-dalek.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[package.metadata.deb]
+depends = "$auto, pulseaudio-utils, alsa-utils"
+section = "sound"
+priority = "optional"
+assets = [
+    ["../../README.md", "usr/share/doc/velin-app/README.md", "644"],
+    ["../../LICENSE", "usr/share/doc/velin-app/LICENSE", "644"],
+]

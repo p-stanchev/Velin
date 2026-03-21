@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 /debug/
+/dist/
 
 # Rust backup files
 **/*.rs.bk
