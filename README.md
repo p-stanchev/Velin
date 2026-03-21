@@ -43,6 +43,7 @@ What exists now:
 - Sender capture mode selection for system audio, microphone, or mixed system-plus-microphone
 - Advanced sender capture overrides for specific Linux sources and external virtual devices
 - Receiver-side concurrent multi-stream mixing from multiple senders
+- Headless sender and receiver commands that run from saved settings without the GUI
 - Dark and light mode in the app
 - TCP control handshake plus UDP frame streaming
 - Stop, disconnect, mute, and graceful window-close shutdown
@@ -82,6 +83,7 @@ What it does not do yet:
 | Receiver behavior | Receiver advertises itself on LAN, accepts multiple concurrent senders, mixes them into one output, and reports frame activity |
 | Security | Sessions use encrypted pairing with trusted fingerprint confirmation |
 | Session controls | Start, stop, disconnect, and mute are available in the GUI |
+| Headless mode | `headless` / `service` sender and receiver commands run without the GUI and reuse saved settings |
 | CLI fallback | `listen` and `connect <ip>` still work |
 
 ---
@@ -170,7 +172,7 @@ velin/
 - [x] Virtual sinks and sources
 - [x] Multi-stream support
 - [x] Encrypted sessions and trusted pairing
-- [ ] Headless or service mode
+- [x] Headless or service mode
 
 ---
 
@@ -196,7 +198,18 @@ CLI fallback:
 ```bash
 cargo run -p velin-app -- listen
 cargo run -p velin-app -- connect 127.0.0.1
+cargo run -p velin-app -- headless receiver
+cargo run -p velin-app -- headless sender
+cargo run -p velin-app -- service sender 192.168.0.62
 ```
+
+Headless and service commands:
+
+- `headless receiver` or `service receiver` starts the receiver without opening the GUI
+- `headless sender [target-ip]` or `service sender [target-ip]` starts the sender without the GUI
+- `headless` prompts in the terminal when an unknown peer fingerprint must be approved
+- `service` is non-interactive and only works with already-trusted peers
+- if sender mode omits `[target-ip]`, Velin uses the saved target IP from settings
 
 ### Requirements
 

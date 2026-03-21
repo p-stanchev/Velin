@@ -1109,7 +1109,7 @@ slint::slint! {
                         }
 
                         Text {
-                            text: "Advanced sender capture controls plus the remaining routing work that still needs transport changes.";
+                            text: "Advanced sender capture controls, headless launch guidance, and remaining routing work.";
                             color: root.text-secondary;
                             font-size: 12px;
                         }
@@ -1283,6 +1283,52 @@ slint::slint! {
                                             font-size: 10px;
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+                            height: 144px;
+
+                            VerticalBox {
+                                padding: 12px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "Headless / Service Mode";
+                                    color: root.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: "Velin can now run without the desktop UI by reusing your saved settings.";
+                                    color: root.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+
+                                Text {
+                                    text: "Receiver: cargo run -p velin-app -- headless receiver";
+                                    color: root.text-primary;
+                                    font-size: 11px;
+                                }
+
+                                Text {
+                                    text: "Sender: cargo run -p velin-app -- headless sender [target-ip]";
+                                    color: root.text-primary;
+                                    font-size: 11px;
+                                }
+
+                                Text {
+                                    text: "Headless prompts for unknown fingerprints in the terminal. `service` stays non-interactive and expects already-trusted peers. Sender mode falls back to the saved target IP when no address is provided.";
+                                    color: root.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
                                 }
                             }
                         }

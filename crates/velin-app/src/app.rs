@@ -14,6 +14,7 @@ use crate::transport::{
 use crate::ui::AppWindow;
 use anyhow::{Context, Result, anyhow};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, VecModel};
+use std::io::{self, Write};
 use std::process::Command;
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -56,7 +57,7 @@ struct PairingPromptState {
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
-    let mode = args.get(1).map(String::as_str).ok_or_else(usage)?;
+    let command = parse_cli_command(args)?;
     let settings = SettingsStore::new()?
         .load_or_default()
         .context("failed to load settings")?;
@@ -71,15 +72,64 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             ctrl_c_status("Ctrl+C received. Stopping session...".to_string());
         }
     });
+    let pairing_prompt = command
+        .interactive_pairing()
+        .then(cli_pairing_prompt);
+
+    match command {
+        CliCommand::Receiver { .. } => {
+            run_target(config, status, None, pairing_prompt, stop_rx, mute_rx).await
+        }
+        CliCommand::Sender { address, .. } => {
+            let mut config = config;
+            if let Some(address) = address {
+                config.target_ip = address;
+            }
+            run_source_with_reconnect(config, status, None, pairing_prompt, stop_rx, mute_rx).await
+        }
+    }
+}
+
+enum CliCommand {
+    Receiver { interactive_pairing: bool },
+    Sender { address: Option<String>, interactive_pairing: bool },
+}
+
+impl CliCommand {
+    fn interactive_pairing(&self) -> bool {
+        match self {
+            Self::Receiver { interactive_pairing } => *interactive_pairing,
+            Self::Sender {
+                interactive_pairing,
+                ..
+            } => *interactive_pairing,
+        }
+    }
+}
+
+fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
+    let Some(mode) = args.get(1).map(String::as_str) else {
+        return Err(usage());
+    };
 
     match mode {
-        "target" | "listen" => run_target(config, status, None, None, stop_rx, mute_rx).await,
-        "source" | "connect" => {
-            let address = args.get(2).map(String::as_str).ok_or_else(usage)?;
-            let mut config = config;
-            config.target_ip = address.to_string();
-            run_source_with_reconnect(config, status, None, None, stop_rx, mute_rx).await
-        }
+        "listen" | "target" => Ok(CliCommand::Receiver {
+            interactive_pairing: false,
+        }),
+        "connect" | "source" => Ok(CliCommand::Sender {
+            address: Some(args.get(2).cloned().ok_or_else(usage)?),
+            interactive_pairing: false,
+        }),
+        "headless" | "service" => match args.get(2).map(String::as_str) {
+            Some("listen") | Some("receiver") | Some("target") => Ok(CliCommand::Receiver {
+                interactive_pairing: mode == "headless",
+            }),
+            Some("connect") | Some("sender") | Some("source") => Ok(CliCommand::Sender {
+                address: args.get(3).cloned(),
+                interactive_pairing: mode == "headless",
+            }),
+            _ => Err(usage()),
+        },
         _ => Err(usage()),
     }
 }
@@ -1000,7 +1050,7 @@ fn detected_default_microphone_name() -> String {
 
 pub fn usage() -> anyhow::Error {
     anyhow!(
-        "usage:\n  cargo run -p velin-app\n  cargo run -p velin-app -- listen\n  cargo run -p velin-app -- connect <target-ip>\n\nlegacy aliases:\n  target -> listen\n  source <ip> -> connect <ip>"
+        "usage:\n  cargo run -p velin-app\n  cargo run -p velin-app -- listen\n  cargo run -p velin-app -- connect <target-ip>\n  cargo run -p velin-app -- headless receiver\n  cargo run -p velin-app -- headless sender [target-ip]\n  cargo run -p velin-app -- service receiver\n  cargo run -p velin-app -- service sender [target-ip]\n\nnotes:\n  headless/service commands use saved settings and run without the GUI\n  headless prompts in the terminal for unknown peer fingerprints\n  service is non-interactive and requires peers to already be trusted\n  if [target-ip] is omitted for sender mode, the saved target IP is used\n\nlegacy aliases:\n  target -> listen\n  source <ip> -> connect <ip>"
     )
 }
 
@@ -1044,6 +1094,33 @@ fn cli_status_sink() -> StatusSink {
     Arc::new(|message| {
         println!("{message}");
     })
+}
+
+fn cli_pairing_prompt() -> PairingPrompt {
+    Arc::new(move |request: PairingRequest| prompt_cli_pairing(&request))
+}
+
+fn prompt_cli_pairing(request: &PairingRequest) -> Result<bool> {
+    println!();
+    println!("New peer fingerprint confirmation required.");
+    println!("Role: {}", request.role);
+    println!("Peer: {}", request.peer_name);
+    println!("Fingerprint: {}", request.fingerprint);
+    print!("Trust this peer? [y/N]: ");
+    io::stdout().flush().context("failed to flush pairing prompt")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read pairing confirmation")?;
+    let decision = matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+
+    println!(
+        "{} {}.",
+        if decision { "Trusted" } else { "Rejected" },
+        request.peer_name
+    );
+    Ok(decision)
 }
 
 fn ui_status_sink(weak: &slint::Weak<AppWindow>) -> StatusSink {
