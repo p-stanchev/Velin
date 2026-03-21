@@ -446,7 +446,7 @@ pub async fn run_source(
             .derive_session_key(&accept.identity_public_key)
             .context("failed to derive sender session key")?,
     );
-    let (mut control_read, _control_write) = stream.into_split();
+    let (mut control_read, control_write) = stream.into_split();
     let audio_addr = format!("{}:{}", config.target_ip, accept.audio_port);
 
     let audio_socket = UdpSocket::bind("0.0.0.0:0")
@@ -458,6 +458,7 @@ pub async fn run_source(
         .with_context(|| format!("failed to connect audio socket to {audio_addr}"))?;
 
     status(format!("Connected to receiver {}.", accept.target_name));
+    let _control_write = control_write;
     let mute_rx = mute_rx;
     let mut pending_samples = VecDeque::<i16>::new();
     let frame_sample_count = frame_sample_count(capture.sample_rate_hz());
@@ -924,8 +925,9 @@ async fn accept_receiver_stream(
     });
     status(format!("Sender {sender_name} connected from {peer_addr}."));
 
-    let (mut control_read, _) = stream.into_split();
+    let (mut control_read, control_write) = stream.into_split();
     tokio::spawn(async move {
+        let _control_write = control_write;
         loop {
             match poll_control_channel(&mut control_read).await {
                 Ok(ControlChannelState::Alive) => time::sleep(Duration::from_millis(50)).await,
