@@ -1,6 +1,9 @@
 use crate::audio::open_output_device;
 use crate::capture::start_system_audio_capture;
+use crate::security::{SecurityStore, TrustOutcome};
 use anyhow::{Context, Result, bail};
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use local_ip_address::list_afinet_netifas;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -19,9 +22,11 @@ use velin_proto::{
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 pub type MetricsSink = Arc<dyn Fn(String) + Send + Sync>;
+pub type PairingPrompt = Arc<dyn Fn(PairingRequest) -> Result<bool> + Send + Sync>;
 const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 2;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
 const CONSECUTIVE_MISSING_REBUFFER_THRESHOLD: u64 = 4;
+const AUDIO_PACKET_HEADER_LEN: usize = 8;
 
 #[cfg(target_os = "linux")]
 const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 6;
@@ -52,13 +57,28 @@ pub struct SessionConfig {
     pub audio_port: u16,
 }
 
+struct SessionCipher {
+    cipher: ChaCha20Poly1305,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingRequest {
+    pub peer_name: String,
+    pub fingerprint: String,
+    pub role: String,
+}
+
 pub async fn run_target(
     config: SessionConfig,
     status: StatusSink,
     metrics: Option<MetricsSink>,
+    pairing_prompt: Option<PairingPrompt>,
     mut stop_rx: watch::Receiver<bool>,
     mut mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut security =
+        SecurityStore::load_or_create().context("failed to load local pairing identity")?;
+    let local_identity = security.local_identity()?;
     let bind_ip = normalized_bind_ip(&config.bind_ip);
     let control_addr = format!("{bind_ip}:{}", config.control_port);
     let audio_addr = format!("{bind_ip}:{}", config.audio_port);
@@ -116,6 +136,30 @@ pub async fn run_target(
     };
     let hello: Hello = read_json_message(&mut stream).await?;
 
+    match security.verify_peer(&hello.source_name, &hello.identity_public_key)? {
+        TrustOutcome::Trusted => {}
+        TrustOutcome::Untrusted { machine_name: peer_name, fingerprint } => {
+            let Some(prompt) = pairing_prompt.as_ref() else {
+                bail!("sender {peer_name} is not trusted yet; fingerprint confirmation is required");
+            };
+            let approved = prompt(PairingRequest {
+                peer_name: peer_name.clone(),
+                fingerprint: fingerprint.clone(),
+                role: "sender".to_string(),
+            })?;
+            if !approved {
+                bail!("pairing rejected for sender {peer_name}");
+            }
+            security.trust_peer(&peer_name, &hello.identity_public_key)?;
+            status(format!("Trusted sender {peer_name} with fingerprint {fingerprint}."));
+        }
+    }
+    let session_cipher = SessionCipher::new(
+        local_identity
+            .derive_session_key(&hello.identity_public_key)
+            .context("failed to derive receiver session key")?,
+    );
+
     status(format!("Sender {} connected from {peer_addr}.", hello.source_name));
     emit_metrics(
         &metrics,
@@ -130,6 +174,7 @@ pub async fn run_target(
     let accept = Accept {
         target_name: host_name(),
         audio_port: config.audio_port,
+        identity_public_key: local_identity.public_key_hex(),
     };
     write_json_message(&mut stream, &accept).await?;
 
@@ -163,7 +208,7 @@ pub async fn run_target(
             result = audio_socket.recv_from(&mut packet) => {
                 let (len, from) = result.context("failed to receive audio frame")?;
 
-                let Some(frame) = AudioFrame::decode(&packet[..len]) else {
+                let Some(frame) = decode_audio_packet(&packet[..len], &session_cipher) else {
                     status(format!("Discarded malformed packet from {from}."));
                     continue;
                 };
@@ -379,9 +424,13 @@ pub async fn run_source(
     config: SessionConfig,
     status: StatusSink,
     metrics: Option<MetricsSink>,
+    pairing_prompt: Option<PairingPrompt>,
     mut stop_rx: watch::Receiver<bool>,
     mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut security =
+        SecurityStore::load_or_create().context("failed to load local pairing identity")?;
+    let local_identity = security.local_identity()?;
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
     emit_metrics(
         &metrics,
@@ -415,6 +464,7 @@ pub async fn run_source(
         source_name: host_name(),
         sample_rate_hz: capture.sample_rate_hz(),
         channels: CHANNELS,
+        identity_public_key: local_identity.public_key_hex(),
     };
     write_json_message(&mut stream, &hello).await?;
 
@@ -422,6 +472,29 @@ pub async fn run_source(
         result = read_json_message(&mut stream) => result,
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
     }?;
+    match security.verify_peer(&accept.target_name, &accept.identity_public_key)? {
+        TrustOutcome::Trusted => {}
+        TrustOutcome::Untrusted { machine_name: peer_name, fingerprint } => {
+            let Some(prompt) = pairing_prompt.as_ref() else {
+                bail!("receiver {peer_name} is not trusted yet; fingerprint confirmation is required");
+            };
+            let approved = prompt(PairingRequest {
+                peer_name: peer_name.clone(),
+                fingerprint: fingerprint.clone(),
+                role: "receiver".to_string(),
+            })?;
+            if !approved {
+                bail!("pairing rejected for receiver {peer_name}");
+            }
+            security.trust_peer(&peer_name, &accept.identity_public_key)?;
+            status(format!("Trusted receiver {peer_name} with fingerprint {fingerprint}."));
+        }
+    }
+    let session_cipher = SessionCipher::new(
+        local_identity
+            .derive_session_key(&accept.identity_public_key)
+            .context("failed to derive sender session key")?,
+    );
     let (mut control_read, _control_write) = stream.into_split();
     let audio_addr = format!("{}:{}", config.target_ip, accept.audio_port);
 
@@ -473,7 +546,7 @@ pub async fn run_source(
                 sequence,
                 samples: frame_samples,
             };
-            let encoded = frame.encode();
+            let encoded = encode_audio_packet(&frame, &session_cipher);
             let scheduled_send = send_start + frame_duration_for(sequence, capture.sample_rate_hz());
             if scheduled_send > time::Instant::now() {
                 tokio::select! {
@@ -522,6 +595,7 @@ pub async fn run_source_with_reconnect(
     config: SessionConfig,
     status: StatusSink,
     metrics: Option<MetricsSink>,
+    pairing_prompt: Option<PairingPrompt>,
     mut stop_rx: watch::Receiver<bool>,
     mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -533,6 +607,7 @@ pub async fn run_source_with_reconnect(
             config.clone(),
             Arc::clone(&status),
             metrics.clone(),
+            pairing_prompt.clone(),
             stop_rx.clone(),
             mute_rx.clone(),
         )
@@ -633,6 +708,71 @@ fn samples_per_10ms(sample_rate_hz: u32) -> usize {
 
 fn frame_sample_count(sample_rate_hz: u32) -> usize {
     samples_per_10ms(sample_rate_hz) * CHANNELS as usize
+}
+
+impl SessionCipher {
+    fn new(key: [u8; 32]) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new((&key).into()),
+        }
+    }
+
+    fn nonce_for(sequence: u64) -> Nonce {
+        let mut bytes = [0_u8; 12];
+        bytes[4..].copy_from_slice(&sequence.to_le_bytes());
+        *Nonce::from_slice(&bytes)
+    }
+}
+
+fn encode_audio_packet(frame: &AudioFrame, session_cipher: &SessionCipher) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(2 + frame.samples.len() * 2);
+    let sample_count = frame.samples.len() as u16;
+    plaintext.extend_from_slice(&sample_count.to_le_bytes());
+    for sample in &frame.samples {
+        plaintext.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    let nonce = SessionCipher::nonce_for(frame.sequence);
+    session_cipher
+        .cipher
+        .encrypt_in_place(&nonce, &frame.sequence.to_le_bytes(), &mut plaintext)
+        .expect("audio packet encryption should not fail");
+
+    let mut bytes = Vec::with_capacity(AUDIO_PACKET_HEADER_LEN + plaintext.len());
+    bytes.extend_from_slice(&frame.sequence.to_le_bytes());
+    bytes.extend_from_slice(&plaintext);
+    bytes
+}
+
+fn decode_audio_packet(bytes: &[u8], session_cipher: &SessionCipher) -> Option<AudioFrame> {
+    if bytes.len() < AUDIO_PACKET_HEADER_LEN {
+        return None;
+    }
+
+    let sequence = u64::from_le_bytes(bytes[..AUDIO_PACKET_HEADER_LEN].try_into().ok()?);
+    let nonce = SessionCipher::nonce_for(sequence);
+    let mut ciphertext = bytes[AUDIO_PACKET_HEADER_LEN..].to_vec();
+    session_cipher
+        .cipher
+        .decrypt_in_place(&nonce, &sequence.to_le_bytes(), &mut ciphertext)
+        .ok()?;
+
+    if ciphertext.len() < 2 {
+        return None;
+    }
+
+    let sample_count = u16::from_le_bytes(ciphertext[..2].try_into().ok()?) as usize;
+    let payload = &ciphertext[2..];
+    if payload.len() != sample_count * 2 {
+        return None;
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for chunk in payload.chunks_exact(2) {
+        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+
+    Some(AudioFrame { sequence, samples })
 }
 
 fn resample_stereo_i16(

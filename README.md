@@ -166,7 +166,7 @@ velin/
 - [ ] Microphone forwarding
 - [ ] Virtual sinks and sources
 - [ ] Multi-stream support
-- [ ] Encrypted sessions and trusted pairing
+- [x] Encrypted sessions and trusted pairing
 - [ ] Headless or service mode
 
 ---

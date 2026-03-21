@@ -2,7 +2,7 @@ use crate::audio::{default_output_device_name, output_device_names};
 use crate::discovery::{DiscoveredPeer, DiscoveryAdvertiser, PeerUpdateSink, request_discovery, run_discovery_service};
 use crate::settings::{AppSettings, PreferredPeer, SettingsStore, ThemeMode};
 use crate::transport::{
-    MetricsSink, StatusSink, advertised_ipv4_addresses_for, local_ipv4_addresses,
+    MetricsSink, PairingPrompt, PairingRequest, StatusSink, advertised_ipv4_addresses_for, local_ipv4_addresses,
     local_ipv4_summary, local_machine_name, local_primary_ipv4, run_source_with_reconnect,
     run_target,
 };
@@ -11,6 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, VecModel};
 use std::process::Command;
 use std::collections::HashSet;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
@@ -33,6 +34,15 @@ struct PeerChoice {
     ip: String,
 }
 
+#[derive(Default)]
+struct PairingPromptState {
+    pending: bool,
+    peer_name: String,
+    fingerprint: String,
+    role: String,
+    decision_tx: Option<mpsc::Sender<bool>>,
+}
+
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let mode = args.get(1).map(String::as_str).ok_or_else(usage)?;
     let settings = SettingsStore::new()?
@@ -44,12 +54,12 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
     let (_mute_tx, mute_rx) = watch::channel(false);
 
     match mode {
-        "target" | "listen" => run_target(config, status, None, stop_rx, mute_rx).await,
+        "target" | "listen" => run_target(config, status, None, None, stop_rx, mute_rx).await,
         "source" | "connect" => {
             let address = args.get(2).map(String::as_str).ok_or_else(usage)?;
             let mut config = config;
             config.target_ip = address.to_string();
-            run_source_with_reconnect(config, status, None, stop_rx, mute_rx).await
+            run_source_with_reconnect(config, status, None, None, stop_rx, mute_rx).await
         }
         _ => Err(usage()),
     }
@@ -60,6 +70,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     let settings = Arc::new(Mutex::new(store.load_or_default()?));
     let discovered_peers = Arc::new(Mutex::new(Vec::<DiscoveredPeer>::new()));
     let peer_choices = Arc::new(Mutex::new(Vec::<PeerChoice>::new()));
+    let pairing_state = Arc::new(Mutex::new(PairingPromptState::default()));
     let discovery_advertiser = DiscoveryAdvertiser::default();
     let app = AppWindow::new().context("failed to create Slint app window")?;
     let session_state = Arc::new(Mutex::new(SessionState::default()));
@@ -85,6 +96,10 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.set_status_text("Idle".into());
         app.set_metrics_text("No active stream.\n".into());
         app.set_log_text("Velin ready.\n".into());
+        app.set_pairing_pending(false);
+        app.set_pairing_peer_name("".into());
+        app.set_pairing_fingerprint("".into());
+        app.set_pairing_role("".into());
         apply_peer_options(&app, &settings.lock().expect("settings poisoned"), &peer_choices, &[]);
     }
 
@@ -228,12 +243,34 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         });
     }
 
+    let pairing_prompt = make_pairing_prompt(&app.as_weak(), &pairing_state);
+
+    {
+        let weak = app.as_weak();
+        let pairing_state = Arc::clone(&pairing_state);
+        app.on_pairing_decision(move |approved| {
+            let sender = {
+                let mut state = pairing_state.lock().expect("pairing state poisoned");
+                state.pending = false;
+                state.peer_name.clear();
+                state.fingerprint.clear();
+                state.role.clear();
+                state.decision_tx.take()
+            };
+            if let Some(sender) = sender {
+                let _ = sender.send(approved);
+            }
+            clear_pairing_prompt(&weak, &pairing_state);
+        });
+    }
+
     {
         let runtime = Arc::clone(&runtime);
         let weak = app.as_weak();
         let session_state = Arc::clone(&session_state);
         let settings = Arc::clone(&settings);
         let discovery_advertiser = discovery_advertiser.clone();
+        let pairing_prompt = Arc::clone(&pairing_prompt);
         app.on_start_target(move || {
             if is_running(&session_state) {
                 return;
@@ -255,8 +292,17 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
 
             let session_state = Arc::clone(&session_state);
             let discovery_advertiser = discovery_advertiser.clone();
+            let pairing_prompt = Arc::clone(&pairing_prompt);
             runtime.spawn(async move {
-                let result = run_target(config, status.clone(), Some(metrics), stop_rx, mute_rx).await;
+                let result = run_target(
+                    config,
+                    status.clone(),
+                    Some(metrics),
+                    Some(pairing_prompt),
+                    stop_rx,
+                    mute_rx,
+                )
+                .await;
                 finish_session(&weak, &session_state, status, result, Some(&discovery_advertiser));
             });
         });
@@ -268,6 +314,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         let session_state = Arc::clone(&session_state);
         let settings = Arc::clone(&settings);
         let store = Arc::clone(&store);
+        let pairing_prompt = Arc::clone(&pairing_prompt);
         app.on_start_source(move |target_ip| {
             if is_running(&session_state) {
                 return;
@@ -296,11 +343,13 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
             status(format!("Starting source for {target_ip}..."));
 
             let session_state = Arc::clone(&session_state);
+            let pairing_prompt = Arc::clone(&pairing_prompt);
             runtime.spawn(async move {
                 let result = run_source_with_reconnect(
                     config,
                     status.clone(),
                     Some(metrics),
+                    Some(pairing_prompt),
                     stop_rx,
                     mute_rx,
                 )
@@ -641,6 +690,9 @@ fn finish_session(
     }
     set_running(weak, false);
     set_muted(weak, false);
+    let _ = weak.upgrade_in_event_loop(move |app| {
+        app.set_pairing_pending(false);
+    });
     set_metrics(
         weak,
         "No active stream.\nMetrics update during the next sender or receiver session.".to_string(),
@@ -735,6 +787,59 @@ fn ui_metrics_sink(weak: &slint::Weak<AppWindow>) -> MetricsSink {
     Arc::new(move |message| {
         set_metrics(&weak, message);
     })
+}
+
+fn make_pairing_prompt(
+    weak: &slint::Weak<AppWindow>,
+    pairing_state: &Arc<Mutex<PairingPromptState>>,
+) -> PairingPrompt {
+    let weak = weak.clone();
+    let pairing_state = Arc::clone(pairing_state);
+    Arc::new(move |request: PairingRequest| {
+        let (decision_tx, decision_rx) = mpsc::channel();
+        {
+            let mut state = pairing_state.lock().expect("pairing state poisoned");
+            state.pending = true;
+            state.peer_name = request.peer_name.clone();
+            state.fingerprint = request.fingerprint.clone();
+            state.role = request.role.clone();
+            state.decision_tx = Some(decision_tx);
+        }
+
+        let peer_name = request.peer_name;
+        let fingerprint = request.fingerprint;
+        let role = request.role;
+        let _ = weak.upgrade_in_event_loop(move |app| {
+            app.set_pairing_peer_name(peer_name.into());
+            app.set_pairing_fingerprint(fingerprint.into());
+            app.set_pairing_role(role.into());
+            app.set_pairing_pending(true);
+        });
+
+        decision_rx
+            .recv()
+            .map_err(|_| anyhow!("pairing confirmation was interrupted"))
+    })
+}
+
+fn clear_pairing_prompt(
+    weak: &slint::Weak<AppWindow>,
+    pairing_state: &Arc<Mutex<PairingPromptState>>,
+) {
+    {
+        let mut state = pairing_state.lock().expect("pairing state poisoned");
+        state.pending = false;
+        state.peer_name.clear();
+        state.fingerprint.clear();
+        state.role.clear();
+        state.decision_tx = None;
+    }
+    let _ = weak.upgrade_in_event_loop(move |app| {
+        app.set_pairing_pending(false);
+        app.set_pairing_peer_name("".into());
+        app.set_pairing_fingerprint("".into());
+        app.set_pairing_role("".into());
+    });
 }
 
 fn push_log_line(existing: &str, line: &str) -> String {

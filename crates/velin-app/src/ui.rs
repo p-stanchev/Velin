@@ -83,6 +83,10 @@ slint::slint! {
         in-out property <string> status-text: "Idle";
         in-out property <string> metrics-text: "No active stream.\n";
         in-out property <string> log-text: "";
+        in-out property <bool> pairing-pending: false;
+        in-out property <string> pairing-peer-name: "";
+        in-out property <string> pairing-fingerprint: "";
+        in-out property <string> pairing-role: "";
         in-out property <string> local-addresses: "Local IP unavailable";
         in-out property <string> local-machine-name: "Unknown";
         in-out property <string> local-primary-ip: "Unavailable";
@@ -104,6 +108,7 @@ slint::slint! {
         callback refresh-discovery();
         callback save-settings(string, string, string, string, string, bool);
         callback choose-discovered-peer(string);
+        callback pairing-decision(bool);
         callback report-bug();
 
         title: "Velin";
@@ -960,6 +965,106 @@ slint::slint! {
                         text: root.status-text;
                         color: root.text-primary;
                         font-size: 12px;
+                    }
+                }
+            }
+
+            if root.pairing-pending : Rectangle {
+                background: root.dark-mode ? #111111cc : #f4f2edcc;
+
+                Rectangle {
+                    width: min(parent.width - 48px, 460px);
+                    height: 250px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-color: root.border;
+                    border-width: 1px;
+                    border-radius: 14px;
+                    background: root.panel-bg;
+
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Confirm Fingerprint";
+                            color: root.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: "Verify this " + root.pairing-role + " fingerprint before trusting it.";
+                            color: root.text-secondary;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: root.pairing-peer-name;
+                            color: root.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 10px;
+                            background: root.panel-alt;
+                            min-height: 56px;
+
+                            Text {
+                                x: 12px;
+                                y: (parent.height - self.height) / 2;
+                                width: parent.width - 24px;
+                                text: root.pairing-fingerprint;
+                                color: root.text-primary;
+                                font-size: 15px;
+                                font-family: "Cascadia Mono";
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        Text {
+                            text: "Accept only if the other machine shows the same fingerprint.";
+                            color: root.text-tertiary;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            spacing: 8px;
+
+                            Rectangle { background: transparent; }
+
+                            Rectangle {
+                                width: 120px;
+                                height: 34px;
+                                background: transparent;
+
+                                FlatButton {
+                                    text: "Reject";
+                                    dark-mode: root.dark-mode;
+                                    clickable: true;
+                                    clicked => { root.pairing-decision(false); }
+                                }
+                            }
+
+                            Rectangle {
+                                width: 120px;
+                                height: 34px;
+                                background: transparent;
+
+                                FlatButton {
+                                    text: "Trust";
+                                    dark-mode: root.dark-mode;
+                                    active: true;
+                                    clickable: true;
+                                    clicked => { root.pairing-decision(true); }
+                                }
+                            }
+                        }
                     }
                 }
             }

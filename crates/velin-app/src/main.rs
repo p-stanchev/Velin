@@ -2,6 +2,7 @@ mod audio;
 mod capture;
 mod discovery;
 mod app;
+mod security;
 mod settings;
 mod transport;
 mod ui;

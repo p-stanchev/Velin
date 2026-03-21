@@ -12,12 +12,14 @@ pub struct Hello {
     pub source_name: String,
     pub sample_rate_hz: u32,
     pub channels: u16,
+    pub identity_public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Accept {
     pub target_name: String,
     pub audio_port: u16,
+    pub identity_public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
