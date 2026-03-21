@@ -1,5 +1,9 @@
 use crate::security::SecurityStore;
 use crate::audio::{default_output_device_name, output_device_names};
+use crate::capture::{
+    CaptureMode, default_input_device_name, default_system_capture_source_name, input_device_names,
+    system_capture_source_names,
+};
 use crate::discovery::{DiscoveredPeer, DiscoveryAdvertiser, PeerUpdateSink, request_discovery, run_discovery_service};
 use crate::settings::{AppSettings, PreferredPeer, SettingsStore, ThemeMode};
 use crate::transport::{
@@ -103,6 +107,19 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.set_output_device_selection(
             output_device_selection_label(&current.output_device_name, &output_device_options).into(),
         );
+        app.set_capture_mode_index(capture_mode_index(current.capture_mode));
+        app.set_default_capture_source_name(detected_default_capture_source_name().into());
+        app.set_default_microphone_device_name(detected_default_microphone_name().into());
+        let capture_source_options = capture_source_options();
+        let microphone_device_options = microphone_device_options();
+        app.set_capture_source_options(ModelRc::new(VecModel::from(capture_source_options.clone())));
+        app.set_microphone_device_options(ModelRc::new(VecModel::from(microphone_device_options.clone())));
+        app.set_capture_source_selection(
+            capture_source_selection_label(&current.capture_source_name, &capture_source_options).into(),
+        );
+        app.set_microphone_device_selection(
+            microphone_device_selection_label(&current.microphone_device_name, &microphone_device_options).into(),
+        );
         app.set_control_port(current.control_port.to_string().into());
         app.set_audio_port(current.audio_port.to_string().into());
         app.set_dark_mode(matches!(current.theme_mode, ThemeMode::Dark));
@@ -183,6 +200,24 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     }
 
     {
+        let app_handle = app.as_weak();
+        app.on_select_extra_tab(move || {
+            if let Some(app) = app_handle.upgrade() {
+                app.set_active_tab(3);
+                app.set_discovered_peer_menu_open(false);
+                app.set_capture_source_menu_open(false);
+                app.set_microphone_device_menu_open(false);
+                app.set_default_capture_source_name(detected_default_capture_source_name().into());
+                app.set_default_microphone_device_name(detected_default_microphone_name().into());
+                let capture_source_options = capture_source_options();
+                let microphone_device_options = microphone_device_options();
+                app.set_capture_source_options(ModelRc::new(VecModel::from(capture_source_options.clone())));
+                app.set_microphone_device_options(ModelRc::new(VecModel::from(microphone_device_options.clone())));
+            }
+        });
+    }
+
+    {
         let store = Arc::clone(&store);
         let settings = Arc::clone(&settings);
         let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
@@ -192,11 +227,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
             let bind_ip_selection = bind_ip_selection.to_string();
             let output_device_selection = output_device_selection.to_string();
             let status = ui_status_sink(&weak);
-            let preferred_peers = settings
-                .lock()
-                .expect("settings poisoned")
-                .preferred_peers
-                .clone();
+            let current = settings.lock().expect("settings poisoned").clone();
             match parse_settings_input(
                 &target_ip,
                 &selected_bind_ip(&bind_ip_selection),
@@ -204,7 +235,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
                 control_port.as_str(),
                 audio_port.as_str(),
                 dark_mode,
-                preferred_peers,
+                current,
             ) {
                 Ok(next) => {
                     if let Err(error) = persist_settings(&store, &settings, &weak, &next) {
@@ -216,6 +247,26 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
                     }
                 }
                 Err(_) => {}
+            }
+        });
+    }
+
+    {
+        let store = Arc::clone(&store);
+        let settings = Arc::clone(&settings);
+        let weak = app.as_weak();
+        app.on_save_capture_options(move |capture_mode_index, capture_source_name, microphone_device_name| {
+            let status = ui_status_sink(&weak);
+            let current = settings.lock().expect("settings poisoned").clone();
+            let next = AppSettings {
+                capture_mode: capture_mode_from_index(capture_mode_index),
+                capture_source_name: selected_capture_source(&capture_source_name),
+                microphone_device_name: selected_microphone_device(&microphone_device_name),
+                ..current
+            };
+
+            if let Err(error) = persist_settings(&store, &settings, &weak, &next) {
+                status(format!("Failed to save capture settings: {error:#}"));
             }
         });
     }
@@ -530,6 +581,36 @@ fn output_device_options() -> Vec<slint::SharedString> {
     options
 }
 
+fn capture_source_options() -> Vec<slint::SharedString> {
+    let mut options = vec![slint::SharedString::from(format!(
+        "Automatic ({})",
+        detected_default_capture_source_name()
+    ))];
+    if let Ok(names) = system_capture_source_names() {
+        for name in names {
+            if !options.iter().any(|existing| existing.as_str() == name) {
+                options.push(name.into());
+            }
+        }
+    }
+    options
+}
+
+fn microphone_device_options() -> Vec<slint::SharedString> {
+    let mut options = vec![slint::SharedString::from(format!(
+        "Automatic ({})",
+        detected_default_microphone_name()
+    ))];
+    if let Ok(names) = input_device_names() {
+        for name in names {
+            if !options.iter().any(|existing| existing.as_str() == name) {
+                options.push(name.into());
+            }
+        }
+    }
+    options
+}
+
 fn refresh_security_settings(
     app: &AppWindow,
     trusted_fingerprints: &Arc<Mutex<Vec<TrustedFingerprintChoice>>>,
@@ -711,6 +792,8 @@ fn persist_settings(
     if let Some(app) = weak.upgrade() {
         let bind_ip_options = bind_ip_options();
         let output_device_options = output_device_options();
+        let capture_source_options = capture_source_options();
+        let microphone_device_options = microphone_device_options();
         app.set_target_ip(next.target_ip.clone().into());
         app.set_bind_ip(next.bind_ip.clone().into());
         app.set_bind_ip_options(ModelRc::new(VecModel::from(bind_ip_options.clone())));
@@ -718,6 +801,17 @@ fn persist_settings(
         app.set_output_device_options(ModelRc::new(VecModel::from(output_device_options.clone())));
         app.set_output_device_selection(
             output_device_selection_label(&next.output_device_name, &output_device_options).into(),
+        );
+        app.set_capture_mode_index(capture_mode_index(next.capture_mode));
+        app.set_default_capture_source_name(detected_default_capture_source_name().into());
+        app.set_default_microphone_device_name(detected_default_microphone_name().into());
+        app.set_capture_source_options(ModelRc::new(VecModel::from(capture_source_options.clone())));
+        app.set_microphone_device_options(ModelRc::new(VecModel::from(microphone_device_options.clone())));
+        app.set_capture_source_selection(
+            capture_source_selection_label(&next.capture_source_name, &capture_source_options).into(),
+        );
+        app.set_microphone_device_selection(
+            microphone_device_selection_label(&next.microphone_device_name, &microphone_device_options).into(),
         );
         app.set_control_port(next.control_port.to_string().into());
         app.set_audio_port(next.audio_port.to_string().into());
@@ -810,6 +904,100 @@ fn selected_output_device(selection: &str) -> String {
     }
 }
 
+fn capture_source_selection_label(
+    capture_source_name: &str,
+    options: &[slint::SharedString],
+) -> String {
+    let normalized = capture_source_name.trim();
+    if normalized.is_empty() {
+        return options
+            .first()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Automatic".to_string());
+    }
+
+    if options.iter().any(|value| value.as_str() == normalized) {
+        normalized.to_string()
+    } else {
+        options
+            .first()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Automatic".to_string())
+    }
+}
+
+fn microphone_device_selection_label(
+    microphone_device_name: &str,
+    options: &[slint::SharedString],
+) -> String {
+    let normalized = microphone_device_name.trim();
+    if normalized.is_empty() {
+        return options
+            .first()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Automatic".to_string());
+    }
+
+    if options.iter().any(|value| value.as_str() == normalized) {
+        normalized.to_string()
+    } else {
+        options
+            .first()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Automatic".to_string())
+    }
+}
+
+fn selected_capture_source(selection: &str) -> String {
+    let trimmed = selection.trim();
+    if trimmed.is_empty() || trimmed.starts_with("Automatic (") || trimmed == "Automatic" {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn selected_microphone_device(selection: &str) -> String {
+    let trimmed = selection.trim();
+    if trimmed.is_empty() || trimmed.starts_with("Automatic (") || trimmed == "Automatic" {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn capture_mode_index(mode: CaptureMode) -> i32 {
+    match mode {
+        CaptureMode::System => 0,
+        CaptureMode::Microphone => 1,
+        CaptureMode::SystemPlusMicrophone => 2,
+    }
+}
+
+fn capture_mode_from_index(index: i32) -> CaptureMode {
+    match index {
+        1 => CaptureMode::Microphone,
+        2 => CaptureMode::SystemPlusMicrophone,
+        _ => CaptureMode::System,
+    }
+}
+
+fn detected_default_capture_source_name() -> String {
+    default_system_capture_source_name()
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "System Default".to_string())
+}
+
+fn detected_default_microphone_name() -> String {
+    default_input_device_name()
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Default microphone".to_string())
+}
+
 pub fn usage() -> anyhow::Error {
     anyhow!(
         "usage:\n  cargo run -p velin-app\n  cargo run -p velin-app -- listen\n  cargo run -p velin-app -- connect <target-ip>\n\nlegacy aliases:\n  target -> listen\n  source <ip> -> connect <ip>"
@@ -823,7 +1011,7 @@ fn parse_settings_input(
     control_port: &str,
     audio_port: &str,
     dark_mode: bool,
-    preferred_peers: Vec<PreferredPeer>,
+    current: AppSettings,
 ) -> Result<AppSettings> {
     let control_port = control_port
         .trim()
@@ -838,6 +1026,9 @@ fn parse_settings_input(
         target_ip: target_ip.trim().to_string(),
         bind_ip: bind_ip.trim().to_string(),
         output_device_name: output_device_name.trim().to_string(),
+        capture_mode: current.capture_mode,
+        capture_source_name: current.capture_source_name,
+        microphone_device_name: current.microphone_device_name,
         control_port,
         audio_port,
         theme_mode: if dark_mode {
@@ -845,7 +1036,7 @@ fn parse_settings_input(
         } else {
             ThemeMode::Light
         },
-        preferred_peers,
+        preferred_peers: current.preferred_peers,
     })
 }
 

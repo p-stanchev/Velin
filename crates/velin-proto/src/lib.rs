@@ -10,6 +10,7 @@ pub const CHANNELS: u16 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub source_name: String,
+    pub stream_id: u64,
     pub sample_rate_hz: u32,
     pub channels: u16,
     pub identity_public_key: String,

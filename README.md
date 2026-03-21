@@ -14,7 +14,7 @@ LAN audio routing prototype for Windows and Linux
 
 </div>
 
-> Velin is an early desktop prototype for sending system audio between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, LAN receiver discovery with manual IP fallback, saved basic settings, output device selection, and a working TCP/UDP transport path.
+> Velin is an early desktop prototype for sending system audio between machines on the same local network. Right now it provides a GUI, sender/receiver session flow, LAN receiver discovery with manual IP fallback, saved settings, output device selection, encrypted pairing, and a working TCP/UDP transport path.
 
 <p align="center">
   <a href="#current-state">Current State</a> |
@@ -34,12 +34,15 @@ Velin is not a complete audio router yet. The current codebase is a transport an
 
 What exists now:
 
-- A Slint desktop GUI with `Session` and `Settings` tabs
+- A Slint desktop GUI with `Session`, `Metrics`, `Settings`, and `Extra Options` tabs
 - `Sender` and `Receiver` session modes in the app
 - Manual IP connection for sender mode
 - Automatic receiver discovery in the GUI
 - Persisted local settings for target IP, control port, audio port, and theme
 - Persisted local settings for bind IP and output device selection
+- Sender capture mode selection for system audio, microphone, or mixed system-plus-microphone
+- Advanced sender capture overrides for specific Linux sources and external virtual devices
+- Receiver-side concurrent multi-stream mixing from multiple senders
 - Dark and light mode in the app
 - TCP control handshake plus UDP frame streaming
 - Stop, disconnect, mute, and graceful window-close shutdown
@@ -53,9 +56,8 @@ What exists now:
 What it does not do yet:
 
 - Per-app routing
-- Stream diagnostics beyond simple status text
-- Trusted pairing or encryption
 - Sample-rate conversion
+- Per-stream routing, naming, and mixer controls
 
 ```text
 +----------------+      local network       +----------------+
@@ -74,10 +76,11 @@ What it does not do yet:
 | GUI | Starts by default with a small desktop window |
 | Roles | Sender and receiver actions are available in the session tab |
 | Connection | Receiver discovery works, with manual IP connect as fallback |
-| Settings | Target IP, bind IP, output device, control port, audio port, and theme are saved locally |
+| Settings | Target IP, bind IP, output device, capture defaults, control port, audio port, and theme are saved locally |
 | Transport | TCP handshake (`Hello` -> `Accept`) and UDP frame path work |
-| Sender behavior | Windows sender mode uses WASAPI loopback. Linux sender mode uses a monitor-source capture path on PipeWire/PulseAudio systems |
-| Receiver behavior | Receiver advertises itself on LAN, accepts a connection, plays streamed audio, and reports frame activity |
+| Sender behavior | Windows sender mode uses WASAPI loopback. Linux sender mode uses a monitor-source capture path on PipeWire/PulseAudio systems. Sender capture can run as system audio, microphone, or system-plus-microphone |
+| Receiver behavior | Receiver advertises itself on LAN, accepts multiple concurrent senders, mixes them into one output, and reports frame activity |
+| Security | Sessions use encrypted pairing with trusted fingerprint confirmation |
 | Session controls | Start, stop, disconnect, and mute are available in the GUI |
 | CLI fallback | `listen` and `connect <ip>` still work |
 
@@ -87,9 +90,9 @@ What it does not do yet:
 
 These are still planned, not implemented:
 
-- Stream diagnostics beyond simple status text
-- Trusted pairing or encryption
 - Per-app routing
+- Per-stream routing and mixer controls on the receiver
+- Sample-rate conversion beyond the current basic resampling path
 
 ---
 
@@ -162,10 +165,10 @@ velin/
 
 ### Phase 3: Advanced Routing
 
-- [ ] Specific or per-application audio capture
-- [ ] Microphone forwarding
-- [ ] Virtual sinks and sources
-- [ ] Multi-stream support
+- [x] Specific or per-application audio capture
+- [x] Microphone forwarding
+- [x] Virtual sinks and sources
+- [x] Multi-stream support
 - [x] Encrypted sessions and trusted pairing
 - [ ] Headless or service mode
 
@@ -225,11 +228,13 @@ New-NetFirewallRule -DisplayName "Velin UDP 49002" -Direction Inbound -Action Al
 
 - Windows sender mode now captures real system audio from the default render endpoint.
 - Linux sender mode now captures system audio through a monitor source using `parec`. It can use `VELIN_LINUX_MONITOR` to override the detected monitor source when needed.
+- Sender mode can now run as `System`, `Mic`, or `System + Mic`, and the `Extra Options` tab stores those defaults locally.
+- External virtual devices can be used by selecting or entering the source/device name exposed by the host audio stack.
+- Receiver mode now supports multiple concurrent senders and mixes them into one playback stream.
 - The current receiver can play streamed audio on a selected output device.
 - Linux is part of the project target, but the current prototype work has primarily been exercised on Windows.
 - Receiver mode can bind to `Automatic` (`0.0.0.0`) or a specific local IPv4 address.
 - Receiver discovery uses local-network UDP discovery packets, and sender mode also has a manual refresh action.
-- The current TCP handshake is minimal and unencrypted. Encryption and trusted pairing are future work.
 - Receiver playback currently uses the selected device's default output config. Sample-rate conversion is not implemented yet.
 - Windows capture currently expects the default system mix format to be `48 kHz`.
 - Linux capture currently expects `parec` plus PulseAudio/PipeWire pulse compatibility to be available, and it also runs at `48 kHz`.

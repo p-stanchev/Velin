@@ -76,6 +76,13 @@ slint::slint! {
         in-out property <string> bind-ip-selection: "Automatic";
         in-out property <[string]> output-device-options: ["System Default"];
         in-out property <string> output-device-selection: "System Default";
+        in-out property <int> capture-mode-index: 0;
+        in-out property <[string]> capture-source-options: ["Automatic"];
+        in-out property <string> capture-source-selection: "Automatic";
+        in-out property <[string]> microphone-device-options: ["Automatic"];
+        in-out property <string> microphone-device-selection: "Automatic";
+        in-out property <string> default-capture-source-name: "System Default";
+        in-out property <string> default-microphone-device-name: "Default microphone";
         in-out property <[string]> discovered-peer-options: ["No receivers found"];
         in-out property <string> discovered-peer-selection: "No receivers found";
         in-out property <string> control-port: "49000";
@@ -100,16 +107,20 @@ slint::slint! {
         in-out property <bool> bind-ip-menu-open: false;
         in-out property <bool> output-device-menu-open: false;
         in-out property <bool> discovered-peer-menu-open: false;
+        in-out property <bool> capture-source-menu-open: false;
+        in-out property <bool> microphone-device-menu-open: false;
         in-out property <bool> muted: false;
         callback select-session-tab();
         callback select-metrics-tab();
         callback select-settings-tab();
+        callback select-extra-tab();
         callback start-target();
         callback start-source(string);
         callback stop-session();
         callback toggle-mute();
         callback refresh-discovery();
         callback save-settings(string, string, string, string, string, bool);
+        callback save-capture-options(int, string, string);
         callback save-trust-validity(string);
         callback choose-discovered-peer(string);
         callback clear-selected-fingerprint(string);
@@ -145,7 +156,7 @@ slint::slint! {
                     Rectangle { background: transparent; }
 
                     Rectangle {
-                        width: 120px;
+                        width: 112px;
                         background: transparent;
 
                         FlatButton {
@@ -157,13 +168,15 @@ slint::slint! {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
                                 root.discovered-peer-menu-open = false;
+                                root.capture-source-menu-open = false;
+                                root.microphone-device-menu-open = false;
                                 root.select-session-tab();
                             }
                         }
                     }
 
                     Rectangle {
-                        width: 120px;
+                        width: 112px;
                         background: transparent;
 
                         FlatButton {
@@ -175,13 +188,15 @@ slint::slint! {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
                                 root.discovered-peer-menu-open = false;
+                                root.capture-source-menu-open = false;
+                                root.microphone-device-menu-open = false;
                                 root.select-metrics-tab();
                             }
                         }
                     }
 
                     Rectangle {
-                        width: 120px;
+                        width: 112px;
                         background: transparent;
 
                         FlatButton {
@@ -193,13 +208,35 @@ slint::slint! {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
                                 root.discovered-peer-menu-open = false;
+                                root.capture-source-menu-open = false;
+                                root.microphone-device-menu-open = false;
                                 root.select-settings-tab();
                             }
                         }
                     }
 
                     Rectangle {
-                        width: 140px;
+                        width: 136px;
+                        background: transparent;
+
+                        FlatButton {
+                            text: "Extra Options";
+                            dark-mode: root.dark-mode;
+                            active: root.active-tab == 3;
+                            clickable: root.active-tab != 3;
+                            clicked => {
+                                root.bind-ip-menu-open = false;
+                                root.output-device-menu-open = false;
+                                root.discovered-peer-menu-open = false;
+                                root.capture-source-menu-open = false;
+                                root.microphone-device-menu-open = false;
+                                root.select-extra-tab();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 136px;
                         background: transparent;
 
                         FlatButton {
@@ -209,6 +246,8 @@ slint::slint! {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
                                 root.discovered-peer-menu-open = false;
+                                root.capture-source-menu-open = false;
+                                root.microphone-device-menu-open = false;
                                 root.report-bug();
                             }
                         }
@@ -1043,6 +1082,328 @@ slint::slint! {
                                             root.output-device-selection = option;
                                             root.output-device-menu-open = false;
                                             root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.active-tab == 3 : Rectangle {
+                    border-color: root.border;
+                    border-width: 1px;
+                    border-radius: 14px;
+                    background: root.panel-bg;
+                    height: 640px;
+
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 12px;
+
+                        Text {
+                            text: "Extra Options";
+                            color: root.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: "Advanced sender capture controls plus the remaining routing work that still needs transport changes.";
+                            color: root.text-secondary;
+                            font-size: 12px;
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+                            VerticalBox {
+                                padding: 12px;
+                                spacing: 10px;
+
+                                Text {
+                                    text: "Capture Routing";
+                                    color: root.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: "These settings control sender capture. Linux monitor names and external virtual devices can be entered directly here.";
+                                    color: root.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalBox {
+                                    spacing: 8px;
+                                    height: 34px;
+
+                                    FlatButton {
+                                        text: "System";
+                                        dark-mode: root.dark-mode;
+                                        active: root.capture-mode-index == 0;
+                                        clickable: !root.running;
+                                        clicked => {
+                                            root.capture-mode-index = 0;
+                                            root.save-capture-options(root.capture-mode-index, root.capture-source-selection, root.microphone-device-selection);
+                                        }
+                                    }
+
+                                    FlatButton {
+                                        text: "Mic";
+                                        dark-mode: root.dark-mode;
+                                        active: root.capture-mode-index == 1;
+                                        clickable: !root.running;
+                                        clicked => {
+                                            root.capture-mode-index = 1;
+                                            root.save-capture-options(root.capture-mode-index, root.capture-source-selection, root.microphone-device-selection);
+                                        }
+                                    }
+
+                                    FlatButton {
+                                        text: "System + Mic";
+                                        dark-mode: root.dark-mode;
+                                        active: root.capture-mode-index == 2;
+                                        clickable: !root.running;
+                                        clicked => {
+                                            root.capture-mode-index = 2;
+                                            root.save-capture-options(root.capture-mode-index, root.capture-source-selection, root.microphone-device-selection);
+                                        }
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    spacing: 10px;
+
+                                    VerticalBox {
+                                        spacing: 6px;
+
+                                        Text {
+                                            text: "Specific source or monitor name";
+                                            color: root.text-tertiary;
+                                            font-size: 12px;
+                                        }
+
+                                        Rectangle {
+                                            height: 38px;
+                                            background: transparent;
+
+                                            Rectangle {
+                                                height: 38px;
+                                                border-radius: 9px;
+                                                border-width: 1px;
+                                                border-color: root.border;
+                                                background: root.dark-mode ? #1c1c1c : #ffffff;
+
+                                                Text {
+                                                    x: 12px;
+                                                    y: (parent.height - self.height) / 2;
+                                                    text: root.capture-source-selection;
+                                                    color: root.dark-mode ? #f2f2f2 : #171717;
+                                                    font-size: 13px;
+                                                }
+
+                                                Text {
+                                                    x: parent.width - self.width - 14px;
+                                                    y: (parent.height - self.height) / 2 - 1px;
+                                                    text: root.capture-source-menu-open ? "˄" : "˅";
+                                                    color: root.dark-mode ? #c9c9c9 : #5a564f;
+                                                    font-size: 13px;
+                                                }
+
+                                                TouchArea {
+                                                    enabled: !root.running;
+                                                    clicked => {
+                                                        root.capture-source-menu-open = !root.capture-source-menu-open;
+                                                        root.microphone-device-menu-open = false;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "Detected default: " + root.default-capture-source-name;
+                                            color: root.text-secondary;
+                                            font-size: 10px;
+                                        }
+                                    }
+
+                                    VerticalBox {
+                                        spacing: 6px;
+
+                                        Text {
+                                            text: "Microphone device name";
+                                            color: root.text-tertiary;
+                                            font-size: 12px;
+                                        }
+
+                                        Rectangle {
+                                            height: 38px;
+                                            background: transparent;
+
+                                            Rectangle {
+                                                height: 38px;
+                                                border-radius: 9px;
+                                                border-width: 1px;
+                                                border-color: root.border;
+                                                background: root.dark-mode ? #1c1c1c : #ffffff;
+
+                                                Text {
+                                                    x: 12px;
+                                                    y: (parent.height - self.height) / 2;
+                                                    text: root.microphone-device-selection;
+                                                    color: root.dark-mode ? #f2f2f2 : #171717;
+                                                    font-size: 13px;
+                                                }
+
+                                                Text {
+                                                    x: parent.width - self.width - 14px;
+                                                    y: (parent.height - self.height) / 2 - 1px;
+                                                    text: root.microphone-device-menu-open ? "˄" : "˅";
+                                                    color: root.dark-mode ? #c9c9c9 : #5a564f;
+                                                    font-size: 13px;
+                                                }
+
+                                                TouchArea {
+                                                    enabled: !root.running;
+                                                    clicked => {
+                                                        root.microphone-device-menu-open = !root.microphone-device-menu-open;
+                                                        root.capture-source-menu-open = false;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "Detected default: " + root.default-microphone-device-name;
+                                            color: root.text-secondary;
+                                            font-size: 10px;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+                            height: 114px;
+
+                            VerticalBox {
+                                padding: 12px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "Multi-stream Support";
+                                    color: root.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: "Implemented in a first version: one receiver can now accept multiple concurrent senders and mix them into one playback output. Per-stream routing and mixer controls are still future work.";
+                                    color: root.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    if root.capture-source-menu-open : Rectangle {
+                        x: 18px;
+                        y: 210px;
+                        width: (parent.width - 46px) / 2;
+                        height: min(root.capture-source-options.length * 30px + 12px, 162px);
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: root.border;
+                        background: root.dark-mode ? #1c1c1c : #ffffff;
+                        clip: true;
+
+                        ScrollView {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: self.visible-width;
+                            viewport-height: root.capture-source-options.length * 30px;
+
+                            VerticalBox {
+                                spacing: 0px;
+
+                                for option[index] in root.capture-source-options : Rectangle {
+                                    height: 30px;
+                                    background: option == root.capture-source-selection
+                                        ? (root.dark-mode ? #232923 : #eef3ec)
+                                        : (capture-source-option-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+
+                                    Text {
+                                        x: 12px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: option;
+                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                        font-size: 13px;
+                                    }
+
+                                    capture-source-option-touch := TouchArea {
+                                        clicked => {
+                                            root.capture-source-selection = option;
+                                            root.capture-source-menu-open = false;
+                                            root.save-capture-options(root.capture-mode-index, root.capture-source-selection, root.microphone-device-selection);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.microphone-device-menu-open : Rectangle {
+                        x: parent.width / 2 + 5px;
+                        y: 210px;
+                        width: (parent.width - 46px) / 2;
+                        height: min(root.microphone-device-options.length * 30px + 12px, 162px);
+                        border-radius: 9px;
+                        border-width: 1px;
+                        border-color: root.border;
+                        background: root.dark-mode ? #1c1c1c : #ffffff;
+                        clip: true;
+
+                        ScrollView {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: self.visible-width;
+                            viewport-height: root.microphone-device-options.length * 30px;
+
+                            VerticalBox {
+                                spacing: 0px;
+
+                                for option[index] in root.microphone-device-options : Rectangle {
+                                    height: 30px;
+                                    background: option == root.microphone-device-selection
+                                        ? (root.dark-mode ? #232923 : #eef3ec)
+                                        : (microphone-device-option-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+
+                                    Text {
+                                        x: 12px;
+                                        y: (parent.height - self.height) / 2;
+                                        text: option;
+                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                        font-size: 13px;
+                                    }
+
+                                    microphone-device-option-touch := TouchArea {
+                                        clicked => {
+                                            root.microphone-device-selection = option;
+                                            root.microphone-device-menu-open = false;
+                                            root.save-capture-options(root.capture-mode-index, root.capture-source-selection, root.microphone-device-selection);
                                         }
                                     }
                                 }

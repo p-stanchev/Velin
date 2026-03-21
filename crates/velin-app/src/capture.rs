@@ -1,13 +1,34 @@
 use anyhow::Result;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::sync::mpsc;
+use velin_proto::CHANNELS;
 
-pub struct SystemAudioCapture {
-    sample_rate_hz: u32,
-    receiver: mpsc::UnboundedReceiver<Vec<i16>>,
-    _inner: PlatformCapture,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    System,
+    Microphone,
+    SystemPlusMicrophone,
 }
 
-impl SystemAudioCapture {
+impl Default for CaptureMode {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+pub struct AudioCapture {
+    sample_rate_hz: u32,
+    receiver: mpsc::UnboundedReceiver<Vec<i16>>,
+    _inner: CaptureBackend,
+}
+
+impl AudioCapture {
     pub fn sample_rate_hz(&self) -> u32 {
         self.sample_rate_hz
     }
@@ -17,14 +38,298 @@ impl SystemAudioCapture {
     }
 }
 
-pub fn start_system_audio_capture() -> Result<SystemAudioCapture> {
-    let (sample_rate_hz, receiver, inner) = platform::start_capture()?;
+enum CaptureBackend {
+    Platform { _capture: PlatformCapture },
+    Microphone { _capture: MicrophoneCapture },
+    Mixed { _capture: MixedCapture },
+}
 
-    Ok(SystemAudioCapture {
+pub fn start_audio_capture(
+    mode: CaptureMode,
+    system_source_name: &str,
+    microphone_device_name: &str,
+) -> Result<AudioCapture> {
+    let (sample_rate_hz, receiver, inner) = match mode {
+        CaptureMode::System => {
+            let (sample_rate_hz, receiver, inner) = platform::start_system_capture(system_source_name)?;
+            (sample_rate_hz, receiver, CaptureBackend::Platform { _capture: inner })
+        }
+        CaptureMode::Microphone => {
+            let (sample_rate_hz, receiver, inner) = start_microphone_capture(microphone_device_name)?;
+            (sample_rate_hz, receiver, CaptureBackend::Microphone { _capture: inner })
+        }
+        CaptureMode::SystemPlusMicrophone => {
+            let (sample_rate_hz, receiver, inner) =
+                start_mixed_capture(system_source_name, microphone_device_name)?;
+            (sample_rate_hz, receiver, CaptureBackend::Mixed { _capture: inner })
+        }
+    };
+
+    Ok(AudioCapture {
         sample_rate_hz,
         receiver,
         _inner: inner,
     })
+}
+
+pub fn input_device_names() -> Result<Vec<String>> {
+    let host = cpal::default_host();
+    let mut names = host
+        .input_devices()?
+        .map(|device| input_device_label(&device))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+pub fn default_input_device_name() -> Result<Option<String>> {
+    let host = cpal::default_host();
+    let Some(device) = host.default_input_device() else {
+        return Ok(None);
+    };
+    Ok(Some(input_device_label(&device)))
+}
+
+#[cfg(target_os = "linux")]
+pub fn system_capture_source_names() -> Result<Vec<String>> {
+    platform::system_capture_source_names()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn system_capture_source_names() -> Result<Vec<String>> {
+    Ok(vec!["System Default".to_string()])
+}
+
+#[cfg(target_os = "linux")]
+pub fn default_system_capture_source_name() -> Result<Option<String>> {
+    Ok(platform::default_system_capture_source_name())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn default_system_capture_source_name() -> Result<Option<String>> {
+    Ok(Some("System Default".to_string()))
+}
+
+struct MicrophoneCapture {
+    _stream: Stream,
+}
+
+struct MixedCapture {
+    _system: PlatformCapture,
+    _microphone: MicrophoneCapture,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for MixedCapture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_mixed_capture(
+    system_source_name: &str,
+    microphone_device_name: &str,
+) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, MixedCapture)> {
+    let (sample_rate_hz, mut system_rx, system_capture) = platform::start_system_capture(system_source_name)?;
+    let (microphone_rate_hz, mut microphone_rx, microphone_capture) = start_microphone_capture(microphone_device_name)?;
+    let (sender, receiver) = mpsc::unbounded_channel();
+
+    let thread = thread::Builder::new()
+        .name("velin-mixed-capture".to_string())
+        .spawn(move || {
+            let mut mic_buffer = VecDeque::<i16>::new();
+            while let Some(system_chunk) = system_rx.blocking_recv() {
+                while let Ok(mic_chunk) = microphone_rx.try_recv() {
+                    let resampled =
+                        resample_stereo_i16(&mic_chunk, microphone_rate_hz, sample_rate_hz, CHANNELS as usize);
+                    mic_buffer.extend(resampled);
+                    let max_samples = sample_rate_hz as usize * CHANNELS as usize * 2;
+                    if mic_buffer.len() > max_samples {
+                        let overflow = mic_buffer.len() - max_samples;
+                        mic_buffer.drain(0..overflow);
+                    }
+                }
+
+                let mut mixed = Vec::with_capacity(system_chunk.len());
+                for sample in system_chunk {
+                    let mic = mic_buffer.pop_front().unwrap_or(0);
+                    mixed.push((sample as i32 + mic as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+                }
+
+                if sender.send(mixed).is_err() {
+                    break;
+                }
+            }
+        })?;
+
+    Ok((
+        sample_rate_hz,
+        receiver,
+        MixedCapture {
+            _system: system_capture,
+            _microphone: microphone_capture,
+            thread: Some(thread),
+        },
+    ))
+}
+
+fn start_microphone_capture(
+    selected_name: &str,
+) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, MicrophoneCapture)> {
+    let host = cpal::default_host();
+    let device = select_input_device(&host, selected_name)?;
+    let supported_config = device.default_input_config()?;
+    let sample_rate_hz = supported_config.sample_rate();
+    let channels = supported_config.channels() as usize;
+    let stream_config: StreamConfig = supported_config.clone().into();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let state = Arc::new(Mutex::new(MicrophoneBuffer::new(sample_rate_hz, channels, sender)));
+    let error_callback = |error| {
+        eprintln!("microphone capture stream error: {error}");
+    };
+
+    let stream = match supported_config.sample_format() {
+        SampleFormat::I8 => build_microphone_stream::<i8>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::I16 => build_microphone_stream::<i16>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::I24 => build_microphone_stream::<cpal::I24>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::I32 => build_microphone_stream::<i32>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::I64 => build_microphone_stream::<i64>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::U8 => build_microphone_stream::<u8>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::U16 => build_microphone_stream::<u16>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::U32 => build_microphone_stream::<u32>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::U64 => build_microphone_stream::<u64>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::F32 => build_microphone_stream::<f32>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        SampleFormat::F64 => build_microphone_stream::<f64>(&device, &stream_config, Arc::clone(&state), error_callback)?,
+        _ => anyhow::bail!("unsupported microphone sample format"),
+    };
+
+    stream.play()?;
+
+    Ok((sample_rate_hz, receiver, MicrophoneCapture { _stream: stream }))
+}
+
+struct MicrophoneBuffer {
+    sender: mpsc::UnboundedSender<Vec<i16>>,
+    mono_samples: Vec<f32>,
+    chunk_frames: usize,
+    channels: usize,
+}
+
+impl MicrophoneBuffer {
+    fn new(sample_rate_hz: u32, channels: usize, sender: mpsc::UnboundedSender<Vec<i16>>) -> Self {
+        Self {
+            sender,
+            mono_samples: Vec::new(),
+            chunk_frames: ((sample_rate_hz as u64 * 10) / 1000) as usize,
+            channels: channels.max(1),
+        }
+    }
+
+    fn push<T>(&mut self, input: &[T])
+    where
+        T: Sample,
+        f32: cpal::FromSample<T>,
+    {
+        for frame in input.chunks(self.channels) {
+            let mut sum = 0.0_f32;
+            for sample in frame {
+                sum += sample.to_sample::<f32>();
+            }
+            self.mono_samples.push(sum / frame.len().max(1) as f32);
+        }
+
+        while self.mono_samples.len() >= self.chunk_frames {
+            let mut chunk = Vec::with_capacity(self.chunk_frames * CHANNELS as usize);
+            for sample in self.mono_samples.drain(0..self.chunk_frames) {
+                let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                chunk.push(pcm);
+                chunk.push(pcm);
+            }
+            if self.sender.send(chunk).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+fn build_microphone_stream<T>(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    state: Arc<Mutex<MicrophoneBuffer>>,
+    error_callback: impl Fn(cpal::StreamError) + Send + 'static,
+) -> Result<Stream>
+where
+    T: SizedSample + Sample,
+    f32: cpal::FromSample<T>,
+{
+    Ok(device.build_input_stream(
+        config,
+        move |data: &[T], _| {
+            if let Ok(mut state) = state.lock() {
+                state.push(data);
+            }
+        },
+        error_callback,
+        None,
+    )?)
+}
+
+fn select_input_device(host: &cpal::Host, selected_name: &str) -> Result<cpal::Device> {
+    if !selected_name.trim().is_empty() {
+        for device in host.input_devices()? {
+            if input_device_label(&device) == selected_name.trim() {
+                return Ok(device);
+            }
+        }
+    }
+
+    host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("no input device available"))
+}
+
+fn input_device_label(device: &cpal::Device) -> String {
+    if let Ok(description) = device.description() {
+        let text = description.to_string();
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+
+    #[allow(deprecated)]
+    device.name().unwrap_or_else(|_| "Unknown input device".to_string())
+}
+
+fn resample_stereo_i16(input: &[i16], input_rate_hz: u32, output_rate_hz: u32, channels: usize) -> Vec<i16> {
+    if input_rate_hz == output_rate_hz || input.is_empty() || channels == 0 {
+        return input.to_vec();
+    }
+
+    let input_frames = input.len() / channels;
+    if input_frames == 0 {
+        return Vec::new();
+    }
+
+    let output_frames = ((input_frames as u64 * output_rate_hz as u64) / input_rate_hz as u64).max(1) as usize;
+    let ratio = input_rate_hz as f32 / output_rate_hz as f32;
+    let mut output = Vec::with_capacity(output_frames * channels);
+
+    for output_frame in 0..output_frames {
+        let position = output_frame as f32 * ratio;
+        let base = position.floor() as usize;
+        let next = (base + 1).min(input_frames.saturating_sub(1));
+        let frac = position - base as f32;
+
+        for channel in 0..channels {
+            let left = input[base * channels + channel] as f32;
+            let right = input[next * channels + channel] as f32;
+            output.push((left + (right - left) * frac).round() as i16);
+        }
+    }
+
+    output
 }
 
 #[cfg(target_os = "windows")]
@@ -61,8 +366,10 @@ mod platform {
         }
     }
 
-    pub fn start_capture() -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
-        let monitor_source = detect_monitor_source();
+    pub fn start_system_capture(
+        selected_source: &str,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
+        let monitor_source = detect_monitor_source(selected_source);
         let sample_rate_hz = detect_monitor_sample_rate(monitor_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
         let mut last_error = None;
 
@@ -113,6 +420,30 @@ mod platform {
         Err(last_error.unwrap_or_else(|| {
             anyhow!("failed to start Linux system audio capture")
         }))
+    }
+
+    pub fn system_capture_source_names() -> Result<Vec<String>> {
+        let output = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .context("failed to enumerate PulseAudio sources")?;
+        if !output.status.success() {
+            return Err(anyhow!("pactl list short sources exited with {}", output.status));
+        }
+
+        let mut sources = vec!["System Default".to_string()];
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(name) = line.split_whitespace().nth(1) {
+                if !sources.iter().any(|existing| existing == name) {
+                    sources.push(name.to_string());
+                }
+            }
+        }
+        Ok(sources)
+    }
+
+    pub fn default_system_capture_source_name() -> Option<String> {
+        detect_monitor_source("")
     }
 
     #[derive(Clone)]
@@ -169,7 +500,12 @@ mod platform {
         Ok(child)
     }
 
-    fn detect_monitor_source() -> Option<String> {
+    fn detect_monitor_source(selected_source: &str) -> Option<String> {
+        let trimmed_selected = selected_source.trim();
+        if !trimmed_selected.is_empty() && trimmed_selected != "System Default" {
+            return Some(trimmed_selected.to_string());
+        }
+
         if let Ok(value) = env::var("VELIN_LINUX_MONITOR") {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -259,7 +595,9 @@ mod platform {
 
     pub struct UnsupportedCapture;
 
-    pub fn start_capture() -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, UnsupportedCapture)> {
+    pub fn start_system_capture(
+        _selected_source: &str,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, UnsupportedCapture)> {
         bail!("system audio capture is not implemented on this platform yet")
     }
 }
@@ -307,7 +645,9 @@ mod platform {
         }
     }
 
-    pub fn start_capture() -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, WindowsSystemCapture)> {
+    pub fn start_system_capture(
+        _selected_source: &str,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, WindowsSystemCapture)> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std_mpsc::channel();

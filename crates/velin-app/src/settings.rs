@@ -1,3 +1,4 @@
+use crate::capture::CaptureMode;
 use crate::transport::SessionConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,9 @@ pub struct AppSettings {
     pub target_ip: String,
     pub bind_ip: String,
     pub output_device_name: String,
+    pub capture_mode: CaptureMode,
+    pub capture_source_name: String,
+    pub microphone_device_name: String,
     pub control_port: u16,
     pub audio_port: u16,
     pub theme_mode: ThemeMode,
@@ -37,6 +41,9 @@ impl Default for AppSettings {
             target_ip: "127.0.0.1".to_string(),
             bind_ip: "0.0.0.0".to_string(),
             output_device_name: String::new(),
+            capture_mode: CaptureMode::System,
+            capture_source_name: String::new(),
+            microphone_device_name: String::new(),
             control_port: DEFAULT_CONTROL_PORT,
             audio_port: DEFAULT_AUDIO_PORT,
             theme_mode: ThemeMode::Dark,
@@ -51,6 +58,9 @@ impl AppSettings {
             target_ip: self.target_ip.clone(),
             bind_ip: self.bind_ip.clone(),
             output_device_name: self.output_device_name.clone(),
+            capture_mode: self.capture_mode,
+            capture_source_name: self.capture_source_name.clone(),
+            microphone_device_name: self.microphone_device_name.clone(),
             control_port: self.control_port,
             audio_port: self.audio_port,
         }

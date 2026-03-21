@@ -1,19 +1,20 @@
 use crate::audio::open_output_device;
-use crate::capture::start_system_audio_capture;
+use crate::capture::{CaptureMode, start_audio_capture};
 use crate::security::{SecurityStore, TrustOutcome, pairing_fingerprint};
 use anyhow::{Context, Result, bail};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use getrandom::fill as random_fill;
 use local_ip_address::list_afinet_netifas;
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedReadHalf};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 use velin_proto::{
     Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
@@ -26,7 +27,7 @@ pub type PairingPrompt = Arc<dyn Fn(PairingRequest) -> Result<bool> + Send + Syn
 const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 2;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
 const CONSECUTIVE_MISSING_REBUFFER_THRESHOLD: u64 = 4;
-const AUDIO_PACKET_HEADER_LEN: usize = 8;
+const AUDIO_PACKET_HEADER_LEN: usize = 16;
 
 #[cfg(target_os = "linux")]
 const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 6;
@@ -53,12 +54,53 @@ pub struct SessionConfig {
     pub target_ip: String,
     pub bind_ip: String,
     pub output_device_name: String,
+    pub capture_mode: CaptureMode,
+    pub capture_source_name: String,
+    pub microphone_device_name: String,
     pub control_port: u16,
     pub audio_port: u16,
 }
 
 struct SessionCipher {
     cipher: ChaCha20Poly1305,
+}
+
+struct ReceiverStreamState {
+    sender_name: String,
+    sample_rate_hz: u32,
+    session_cipher: SessionCipher,
+    buffered_frames: BTreeMap<u64, Vec<i16>>,
+    next_play_sequence: Option<u64>,
+    jitter_primed: bool,
+    jitter_target_frames: usize,
+    stable_played_frames: u64,
+    depth_samples: u64,
+    depth_sum: u64,
+    last_good_output: Vec<i16>,
+    consecutive_missing_frames: u64,
+    received_frames: u64,
+    played_frames: u64,
+    dropped_frames: u64,
+    underrun_frames: u64,
+    late_packets: u64,
+    reordered_packets: u64,
+    missing_packets: u64,
+    highest_received_sequence: Option<u64>,
+    disconnect_requested: bool,
+    last_packet_at: Instant,
+}
+
+enum ReceiverControlEvent {
+    Connected {
+        stream_id: u64,
+        sender_name: String,
+        sample_rate_hz: u32,
+        session_cipher: SessionCipher,
+    },
+    Disconnected {
+        stream_id: u64,
+    },
+    Status(String),
 }
 
 #[derive(Debug, Clone)]
@@ -76,10 +118,10 @@ pub async fn run_target(
     mut stop_rx: watch::Receiver<bool>,
     mut mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut security =
-        SecurityStore::load_or_create().context("failed to load local pairing identity")?;
-    let local_identity = security.local_identity()?;
-    let local_public_key = local_identity.public_key_hex();
+    let local_public_key = SecurityStore::load_or_create()
+        .context("failed to load local pairing identity")?
+        .local_identity()?
+        .public_key_hex();
     let bind_ip = normalized_bind_ip(&config.bind_ip);
     let control_addr = format!("{bind_ip}:{}", config.control_port);
     let audio_addr = format!("{bind_ip}:{}", config.audio_port);
@@ -103,6 +145,55 @@ pub async fn run_target(
             discovery_status(format!("Discovery broadcast unavailable. {error}"));
         }
     });
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ReceiverControlEvent>();
+    {
+        let status = Arc::clone(&status);
+        let pairing_prompt = pairing_prompt.clone();
+        let local_public_key = local_public_key.clone();
+        let mut accept_stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    result = listener.accept() => result,
+                    _ = wait_for_stop(&mut accept_stop_rx) => break,
+                };
+
+                let (stream, peer_addr) = match accepted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = event_tx.send(ReceiverControlEvent::Status(format!(
+                            "Failed to accept sender connection. {error:#}"
+                        )));
+                        continue;
+                    }
+                };
+
+                let event_tx = event_tx.clone();
+                let pairing_prompt = pairing_prompt.clone();
+                let local_public_key = local_public_key.clone();
+                let status = Arc::clone(&status);
+                tokio::spawn(async move {
+                    let status_tx = event_tx.clone();
+                    if let Err(error) = accept_receiver_stream(
+                        stream,
+                        peer_addr,
+                        &local_public_key,
+                        pairing_prompt,
+                        status,
+                        event_tx,
+                        config.audio_port,
+                    )
+                    .await
+                    {
+                        let _ = status_tx.send(ReceiverControlEvent::Status(format!(
+                            "Receiver stream setup failed. {error:#}"
+                        )));
+                    }
+                });
+            }
+        });
+    }
 
     status(if bind_ip == "0.0.0.0" {
         let local_ips = local_ipv4_addresses();
@@ -131,152 +222,51 @@ pub async fn run_target(
         ),
     );
 
-    let (mut stream, peer_addr) = tokio::select! {
-        result = listener.accept() => result.context("failed to accept source")?,
-        _ = wait_for_stop(&mut stop_rx) => return Ok(()),
-    };
-    let hello: Hello = read_json_message(&mut stream).await?;
-
-    match security.verify_peer(&hello.source_name, &hello.identity_public_key)? {
-        TrustOutcome::Trusted => {}
-        TrustOutcome::Untrusted { machine_name: peer_name, .. } => {
-            let Some(prompt) = pairing_prompt.as_ref() else {
-                bail!("sender {peer_name} is not trusted yet; fingerprint confirmation is required");
-            };
-            let fingerprint = pairing_fingerprint(&local_public_key, &hello.identity_public_key)?;
-            let pairing_required = PairingRequired {
-                target_name: host_name(),
-                identity_public_key: local_public_key.clone(),
-            };
-            write_json_message(&mut stream, &pairing_required).await?;
-            let approved = prompt(PairingRequest {
-                peer_name: peer_name.clone(),
-                fingerprint: fingerprint.clone(),
-                role: "sender".to_string(),
-            })?;
-            if !approved {
-                bail!("pairing rejected for sender {peer_name}");
-            }
-            let decision: PairingDecision = read_json_message(&mut stream).await?;
-            if !decision.approved {
-                bail!("sender {peer_name} rejected the fingerprint confirmation");
-            }
-            security.trust_peer(&peer_name, &hello.identity_public_key)?;
-            status(format!("Trusted sender {peer_name} with fingerprint {fingerprint}."));
-        }
-    }
-    let session_cipher = SessionCipher::new(
-        local_identity
-            .derive_session_key(&hello.identity_public_key)
-            .context("failed to derive receiver session key")?,
-    );
-
-    status(format!("Sender {} connected from {peer_addr}.", hello.source_name));
-    emit_metrics(
-        &metrics,
-        format!(
-            "Mode: Receiver\nState: Connected\nSender: {}\nSender sample rate: {} Hz\nPlayback device: {device_name}\nPlayback config: {}",
-            hello.source_name,
-            hello.sample_rate_hz,
-            player.config_summary()
-        ),
-    );
-
-    let accept = Accept {
-        target_name: host_name(),
-        audio_port: config.audio_port,
-        identity_public_key: local_public_key,
-    };
-    write_json_message(&mut stream, &accept).await?;
-
     let mut output_frame_samples = frame_sample_count(player.sample_rate_hz());
     let mut packet = vec![0_u8; 2048];
-    let mut received_frames = 0_u64;
-    let started = Instant::now();
     let mut playback_tick = time::interval(Duration::from_millis(2));
     playback_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut buffered_frames = BTreeMap::<u64, Vec<i16>>::new();
-    let mut next_play_sequence = None;
-    let mut jitter_primed = false;
-    let mut silence_frame = vec![0_i16; output_frame_samples];
-    let mut played_frames = 0_u64;
-    let mut dropped_frames = 0_u64;
-    let mut underrun_frames = 0_u64;
-    let mut late_packets = 0_u64;
-    let mut reordered_packets = 0_u64;
-    let mut missing_packets = 0_u64;
-    let mut highest_received_sequence = None;
-    let mut jitter_target_frames = JITTER_BUFFER_DEFAULT_TARGET_FRAMES;
-    let mut stable_played_frames = 0_u64;
-    let mut depth_samples = 0_u64;
-    let mut depth_sum = 0_u64;
-    let mut last_good_output = silence_frame.clone();
-    let mut consecutive_missing_frames = 0_u64;
+    let mut streams = HashMap::<u64, ReceiverStreamState>::new();
     let mut last_restart_attempt = Instant::now() - Duration::from_secs(5);
+    let mut metrics_counter = 0_u64;
 
     loop {
         tokio::select! {
+            Some(event) = event_rx.recv() => {
+                match event {
+                    ReceiverControlEvent::Connected { stream_id, sender_name, sample_rate_hz, session_cipher } => {
+                        status(format!("Sender {sender_name} connected as stream #{stream_id}."));
+                        streams.insert(stream_id, ReceiverStreamState::new(
+                            sender_name,
+                            sample_rate_hz,
+                            session_cipher,
+                            output_frame_samples,
+                        ));
+                    }
+                    ReceiverControlEvent::Disconnected { stream_id } => {
+                        if let Some(stream) = streams.get_mut(&stream_id) {
+                            stream.disconnect_requested = true;
+                            status(format!("Sender {} disconnected.", stream.sender_name));
+                        }
+                    }
+                    ReceiverControlEvent::Status(message) => status(message),
+                }
+            }
             result = audio_socket.recv_from(&mut packet) => {
                 let (len, from) = result.context("failed to receive audio frame")?;
 
-                let Some(frame) = decode_audio_packet(&packet[..len], &session_cipher) else {
+                let Some((stream_id, sequence)) = audio_packet_header(&packet[..len]) else {
                     status(format!("Discarded malformed packet from {from}."));
                     continue;
                 };
-
-                received_frames += 1;
-                if next_play_sequence.is_none() {
-                    next_play_sequence = Some(frame.sequence);
-                }
-
-                if let Some(play_sequence) = next_play_sequence {
-                    if frame.sequence < play_sequence {
-                        late_packets += 1;
-                        continue;
-                    }
-                }
-
-                if let Some(highest) = highest_received_sequence {
-                    if frame.sequence < highest {
-                        reordered_packets += 1;
-                    }
-                }
-                highest_received_sequence = Some(highest_received_sequence.map_or(frame.sequence, |value| value.max(frame.sequence)));
-
-                if let Some(play_sequence) = next_play_sequence {
-                    if frame.sequence + JITTER_BUFFER_MAX_FRAMES as u64 <= play_sequence {
-                        dropped_frames += 1;
-                        continue;
-                    }
-                }
-
-                let resampled = resample_stereo_i16(
-                    &frame.samples,
-                    hello.sample_rate_hz,
-                    player.sample_rate_hz(),
-                    CHANNELS as usize,
-                );
-                buffered_frames.entry(frame.sequence).or_insert(resampled);
-
-                while buffered_frames.len() > JITTER_BUFFER_MAX_FRAMES {
-                    if let Some((&oldest, _)) = buffered_frames.first_key_value() {
-                        buffered_frames.remove(&oldest);
-                        dropped_frames += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if !jitter_primed && buffered_frames.len() >= jitter_target_frames {
-                    if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
-                        next_play_sequence = Some(first_sequence);
-                    }
-                    jitter_primed = true;
-                    status(format!("Jitter buffer primed with {} frames.", buffered_frames.len()));
-                }
-
-                depth_sum += buffered_frames.len() as u64;
-                depth_samples += 1;
+                let Some(stream) = streams.get_mut(&stream_id) else {
+                    continue;
+                };
+                let Some(frame) = decode_audio_packet_for_stream(&packet[..len], sequence, &stream.session_cipher) else {
+                    status(format!("Discarded malformed packet from {from} on stream #{stream_id}."));
+                    continue;
+                };
+                stream.receive_frame(frame, player.sample_rate_hz(), output_frame_samples);
             }
             _ = playback_tick.tick() => {
                 if player.take_backend_error() && last_restart_attempt.elapsed() >= Duration::from_secs(1) {
@@ -287,18 +277,17 @@ pub async fn run_target(
                             player = next_player;
                             device_name = next_device_name;
                             output_frame_samples = frame_sample_count(player.sample_rate_hz());
-                            silence_frame = vec![0_i16; output_frame_samples];
-                            last_good_output = silence_frame.clone();
-                            jitter_primed = false;
-                            consecutive_missing_frames = 0;
+                            for stream in streams.values_mut() {
+                                stream.reset_for_output(output_frame_samples);
+                            }
                             player.clear_buffer();
                             status(format!("Playback stream reopened on {device_name}."));
                             status(format!("Playback config: {}.", player.config_summary()));
                             emit_metrics(
                                 &metrics,
                                 format!(
-                                    "Mode: Receiver\nState: Recovering\nSender: {}\nPlayback device: {device_name}\nPlayback config: {}\nAction: Output stream restarted after backend fault",
-                                    hello.source_name,
+                                    "Mode: Receiver\nState: Recovering\nStreams: {}\nPlayback device: {device_name}\nPlayback config: {}\nAction: Output stream restarted after backend fault",
+                                    streams.len(),
                                     player.config_summary()
                                 ),
                             );
@@ -309,116 +298,34 @@ pub async fn run_target(
                     }
                 }
 
-                if !jitter_primed {
-                    continue;
-                }
-
                 let low_water_samples = PLAYBACK_QUEUE_LOW_WATER_FRAMES * output_frame_samples;
                 let target_samples = PLAYBACK_QUEUE_TARGET_FRAMES * output_frame_samples;
 
                 if player.buffered_sample_count() > low_water_samples {
                     continue;
                 }
-
-                let play_sequence = next_play_sequence.get_or_insert(0);
                 let mut queued_any = false;
-
                 while player.buffered_sample_count() < target_samples {
-                    if let Some(samples) = buffered_frames.remove(play_sequence) {
-                        last_good_output.clone_from(&samples);
-                        player.push_samples(&samples);
-                        consecutive_missing_frames = 0;
-                    } else if let Some((&first_available, _)) = buffered_frames.first_key_value() {
-                        if first_available > *play_sequence {
-                            missing_packets += 1;
-                            underrun_frames += 1;
-                            consecutive_missing_frames += 1;
-                            if consecutive_missing_frames <= 2 {
-                                player.push_samples(&last_good_output);
-                            } else {
-                                player.push_samples(&silence_frame);
-                            }
-                            if jitter_target_frames < JITTER_BUFFER_MAX_TARGET_FRAMES {
-                                jitter_target_frames = (jitter_target_frames + 1).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
-                            }
-                            stable_played_frames = 0;
-
-                            if consecutive_missing_frames >= CONSECUTIVE_MISSING_REBUFFER_THRESHOLD {
-                                player.clear_buffer();
-                                jitter_primed = false;
-                                consecutive_missing_frames = 0;
-                                next_play_sequence = buffered_frames.first_key_value().map(|(&sequence, _)| sequence);
-                                status(format!(
-                                    "Receiver rebuffering after packet loss. New target {} frames.",
-                                    jitter_target_frames
-                                ));
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        jitter_primed = false;
-                        consecutive_missing_frames = 0;
+                    let mixed = mix_receiver_streams(&mut streams, output_frame_samples, &status);
+                    let Some(samples) = mixed else {
                         break;
-                    }
-
-                    *play_sequence += 1;
-                    played_frames += 1;
+                    };
+                    player.push_samples(&samples);
                     queued_any = true;
                 }
 
-                if !jitter_primed && buffered_frames.len() >= jitter_target_frames {
-                    if let Some((&first_sequence, _)) = buffered_frames.first_key_value() {
-                        next_play_sequence = Some(first_sequence);
-                    }
-                    jitter_primed = true;
-                    status(format!("Jitter buffer refilled with {} frames.", buffered_frames.len()));
-                }
+                streams.retain(|_, stream| {
+                    !(stream.disconnect_requested
+                        && stream.buffered_frames.is_empty()
+                        && !stream.jitter_primed)
+                        && stream.last_packet_at.elapsed() < Duration::from_secs(10)
+                });
 
                 if queued_any {
-                    stable_played_frames += 1;
-                    if stable_played_frames >= 250
-                        && jitter_target_frames > JITTER_BUFFER_MIN_TARGET_FRAMES
-                        && buffered_frames.len() >= jitter_target_frames
-                    {
-                        jitter_target_frames -= 1;
-                        stable_played_frames = 0;
+                    metrics_counter += 1;
+                    if metrics_counter == 1 || metrics_counter % 100 == 0 {
+                        emit_metrics(&metrics, receiver_metrics_summary(&streams, &player, &device_name));
                     }
-                }
-
-                if queued_any && (played_frames == 1 || played_frames % 100 == 0) {
-                    let seconds = started.elapsed().as_secs_f32();
-                    let average_depth = if depth_samples == 0 {
-                        0.0
-                    } else {
-                        depth_sum as f32 / depth_samples as f32
-                    };
-                    let audio_queue_frames = player.buffered_sample_count() / output_frame_samples;
-                    let network_latency_ms = buffered_frames.len() * 10;
-                    let audio_latency_ms = audio_queue_frames * 10;
-                    status(format!(
-                        "Received {received_frames} frames, played {played_frames}, late {late_packets}, reordered {reordered_packets}, missing {missing_packets}, underruns {underrun_frames}, dropped {dropped_frames}, target {jitter_target_frames}, avg buffer {average_depth:.1}, net buffer {}, audio queue {} in {seconds:.1}s.",
-                        buffered_frames.len(),
-                        audio_queue_frames
-                    ));
-                    emit_metrics(
-                        &metrics,
-                        format!(
-                            "Mode: Receiver\nState: Streaming\nSender: {}\nSource: {} Hz -> Playback: {} Hz\nFrames: received {received_frames}, played {played_frames}\nLatency estimate: {} ms total ({} ms network + {} ms audio)\nNetwork buffer: {} frames\nAudio queue: {} frames\nJitter target: {} frames\nLoss: missing {missing_packets}, late {late_packets}, reordered {reordered_packets}, dropped {dropped_frames}, underruns {underrun_frames}\nAverage network buffer: {:.1} frames\nUptime: {:.1}s",
-                            hello.source_name,
-                            hello.sample_rate_hz,
-                            player.sample_rate_hz(),
-                            network_latency_ms + audio_latency_ms,
-                            network_latency_ms,
-                            audio_latency_ms,
-                            buffered_frames.len(),
-                            audio_queue_frames,
-                            jitter_target_frames,
-                            average_depth,
-                            seconds
-                        ),
-                    );
                 }
             }
             result = mute_rx.changed() => {
@@ -443,6 +350,7 @@ pub async fn run_source(
         SecurityStore::load_or_create().context("failed to load local pairing identity")?;
     let local_identity = security.local_identity()?;
     let local_public_key = local_identity.public_key_hex();
+    let stream_id = random_stream_id()?;
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
     emit_metrics(
         &metrics,
@@ -459,21 +367,29 @@ pub async fn run_source(
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
     };
 
-    let mut capture = start_system_audio_capture().context("failed to start system audio capture")?;
+    let mut capture = start_audio_capture(
+        config.capture_mode,
+        &config.capture_source_name,
+        &config.microphone_device_name,
+    )
+    .context("failed to start configured audio capture")?;
     status(format!(
-        "Capturing system audio at {} Hz.",
+        "Capturing {} at {} Hz.",
+        describe_capture_mode(config.capture_mode),
         capture.sample_rate_hz()
     ));
     emit_metrics(
         &metrics,
         format!(
-            "Mode: Sender\nState: Connected control channel\nTarget: {control_addr}\nCapture rate: {} Hz",
+            "Mode: Sender\nState: Connected control channel\nTarget: {control_addr}\nCapture mode: {}\nCapture rate: {} Hz",
+            describe_capture_mode(config.capture_mode),
             capture.sample_rate_hz()
         ),
     );
 
     let hello = Hello {
         source_name: host_name(),
+        stream_id,
         sample_rate_hz: capture.sample_rate_hz(),
         channels: CHANNELS,
         identity_public_key: local_public_key.clone(),
@@ -581,7 +497,7 @@ pub async fn run_source(
                 sequence,
                 samples: frame_samples,
             };
-            let encoded = encode_audio_packet(&frame, &session_cipher);
+            let encoded = encode_audio_packet(stream_id, &frame, &session_cipher);
             let scheduled_send = send_start + frame_duration_for(sequence, capture.sample_rate_hz());
             if scheduled_send > time::Instant::now() {
                 tokio::select! {
@@ -608,8 +524,9 @@ pub async fn run_source(
                 emit_metrics(
                     &metrics,
                     format!(
-                        "Mode: Sender\nState: Streaming\nReceiver: {}\nCapture rate: {} Hz\nFrames sent: {sequence}\nPending capture queue: {} frames\nPending capture latency: {} ms\nUptime: {:.1}s",
+                        "Mode: Sender\nState: Streaming\nReceiver: {}\nCapture mode: {}\nCapture rate: {} Hz\nFrames sent: {sequence}\nPending capture queue: {} frames\nPending capture latency: {} ms\nUptime: {:.1}s",
                         accept.target_name,
+                        describe_capture_mode(config.capture_mode),
                         capture.sample_rate_hz(),
                         pending_frame_count,
                         pending_latency_ms,
@@ -624,6 +541,14 @@ pub async fn run_source(
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+fn describe_capture_mode(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::System => "system audio",
+        CaptureMode::Microphone => "microphone",
+        CaptureMode::SystemPlusMicrophone => "system + microphone",
+    }
 }
 
 pub async fn run_source_with_reconnect(
@@ -745,6 +670,109 @@ fn frame_sample_count(sample_rate_hz: u32) -> usize {
     samples_per_10ms(sample_rate_hz) * CHANNELS as usize
 }
 
+impl ReceiverStreamState {
+    fn new(
+        sender_name: String,
+        sample_rate_hz: u32,
+        session_cipher: SessionCipher,
+        output_frame_samples: usize,
+    ) -> Self {
+        Self {
+            sender_name,
+            sample_rate_hz,
+            session_cipher,
+            buffered_frames: BTreeMap::new(),
+            next_play_sequence: None,
+            jitter_primed: false,
+            jitter_target_frames: JITTER_BUFFER_DEFAULT_TARGET_FRAMES,
+            stable_played_frames: 0,
+            depth_samples: 0,
+            depth_sum: 0,
+            last_good_output: vec![0; output_frame_samples],
+            consecutive_missing_frames: 0,
+            received_frames: 0,
+            played_frames: 0,
+            dropped_frames: 0,
+            underrun_frames: 0,
+            late_packets: 0,
+            reordered_packets: 0,
+            missing_packets: 0,
+            highest_received_sequence: None,
+            disconnect_requested: false,
+            last_packet_at: Instant::now(),
+        }
+    }
+
+    fn reset_for_output(&mut self, output_frame_samples: usize) {
+        self.last_good_output = vec![0; output_frame_samples];
+        self.jitter_primed = false;
+        self.consecutive_missing_frames = 0;
+    }
+
+    fn receive_frame(&mut self, frame: AudioFrame, output_rate_hz: u32, output_frame_samples: usize) {
+        self.received_frames += 1;
+        self.last_packet_at = Instant::now();
+        if self.next_play_sequence.is_none() {
+            self.next_play_sequence = Some(frame.sequence);
+        }
+
+        if let Some(play_sequence) = self.next_play_sequence {
+            if frame.sequence < play_sequence {
+                self.late_packets += 1;
+                return;
+            }
+        }
+
+        if let Some(highest) = self.highest_received_sequence {
+            if frame.sequence < highest {
+                self.reordered_packets += 1;
+            }
+        }
+        self.highest_received_sequence = Some(
+            self.highest_received_sequence
+                .map_or(frame.sequence, |value| value.max(frame.sequence)),
+        );
+
+        if let Some(play_sequence) = self.next_play_sequence {
+            if frame.sequence + JITTER_BUFFER_MAX_FRAMES as u64 <= play_sequence {
+                self.dropped_frames += 1;
+                return;
+            }
+        }
+
+        let resampled = resample_stereo_i16(
+            &frame.samples,
+            self.sample_rate_hz,
+            output_rate_hz,
+            CHANNELS as usize,
+        );
+        self.buffered_frames.entry(frame.sequence).or_insert(resampled);
+
+        while self.buffered_frames.len() > JITTER_BUFFER_MAX_FRAMES {
+            if let Some((&oldest, _)) = self.buffered_frames.first_key_value() {
+                self.buffered_frames.remove(&oldest);
+                self.dropped_frames += 1;
+            } else {
+                break;
+            }
+        }
+
+        if !self.jitter_primed && self.buffered_frames.len() >= self.jitter_target_frames {
+            if let Some((&first_sequence, _)) = self.buffered_frames.first_key_value() {
+                self.next_play_sequence = Some(first_sequence);
+            }
+            self.jitter_primed = true;
+        }
+
+        if self.last_good_output.len() != output_frame_samples {
+            self.last_good_output.resize(output_frame_samples, 0);
+        }
+
+        self.depth_sum += self.buffered_frames.len() as u64;
+        self.depth_samples += 1;
+    }
+}
+
 impl SessionCipher {
     fn new(key: [u8; 32]) -> Self {
         Self {
@@ -759,7 +787,7 @@ impl SessionCipher {
     }
 }
 
-fn encode_audio_packet(frame: &AudioFrame, session_cipher: &SessionCipher) -> Vec<u8> {
+fn encode_audio_packet(stream_id: u64, frame: &AudioFrame, session_cipher: &SessionCipher) -> Vec<u8> {
     let mut plaintext = Vec::with_capacity(2 + frame.samples.len() * 2);
     let sample_count = frame.samples.len() as u16;
     plaintext.extend_from_slice(&sample_count.to_le_bytes());
@@ -768,28 +796,47 @@ fn encode_audio_packet(frame: &AudioFrame, session_cipher: &SessionCipher) -> Ve
     }
 
     let nonce = SessionCipher::nonce_for(frame.sequence);
+    let mut aad = [0_u8; AUDIO_PACKET_HEADER_LEN];
+    aad[..8].copy_from_slice(&stream_id.to_le_bytes());
+    aad[8..].copy_from_slice(&frame.sequence.to_le_bytes());
     session_cipher
         .cipher
-        .encrypt_in_place(&nonce, &frame.sequence.to_le_bytes(), &mut plaintext)
+        .encrypt_in_place(&nonce, &aad, &mut plaintext)
         .expect("audio packet encryption should not fail");
 
     let mut bytes = Vec::with_capacity(AUDIO_PACKET_HEADER_LEN + plaintext.len());
+    bytes.extend_from_slice(&stream_id.to_le_bytes());
     bytes.extend_from_slice(&frame.sequence.to_le_bytes());
     bytes.extend_from_slice(&plaintext);
     bytes
 }
 
-fn decode_audio_packet(bytes: &[u8], session_cipher: &SessionCipher) -> Option<AudioFrame> {
+fn audio_packet_header(bytes: &[u8]) -> Option<(u64, u64)> {
     if bytes.len() < AUDIO_PACKET_HEADER_LEN {
         return None;
     }
 
-    let sequence = u64::from_le_bytes(bytes[..AUDIO_PACKET_HEADER_LEN].try_into().ok()?);
+    let stream_id = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+    let sequence = u64::from_le_bytes(bytes[8..AUDIO_PACKET_HEADER_LEN].try_into().ok()?);
+    Some((stream_id, sequence))
+}
+
+fn decode_audio_packet_for_stream(
+    bytes: &[u8],
+    sequence: u64,
+    session_cipher: &SessionCipher,
+) -> Option<AudioFrame> {
+    if bytes.len() < AUDIO_PACKET_HEADER_LEN {
+        return None;
+    }
+
     let nonce = SessionCipher::nonce_for(sequence);
     let mut ciphertext = bytes[AUDIO_PACKET_HEADER_LEN..].to_vec();
+    let mut aad = [0_u8; AUDIO_PACKET_HEADER_LEN];
+    aad.copy_from_slice(&bytes[..AUDIO_PACKET_HEADER_LEN]);
     session_cipher
         .cipher
-        .decrypt_in_place(&nonce, &sequence.to_le_bytes(), &mut ciphertext)
+        .decrypt_in_place(&nonce, &aad, &mut ciphertext)
         .ok()?;
 
     if ciphertext.len() < 2 {
@@ -808,6 +855,250 @@ fn decode_audio_packet(bytes: &[u8], session_cipher: &SessionCipher) -> Option<A
     }
 
     Some(AudioFrame { sequence, samples })
+}
+
+async fn accept_receiver_stream(
+    mut stream: TcpStream,
+    peer_addr: std::net::SocketAddr,
+    local_public_key: &str,
+    pairing_prompt: Option<PairingPrompt>,
+    status: StatusSink,
+    event_tx: mpsc::UnboundedSender<ReceiverControlEvent>,
+    audio_port: u16,
+) -> Result<()> {
+    let mut security =
+        SecurityStore::load_or_create().context("failed to load local pairing identity")?;
+    let local_identity = security.local_identity()?;
+    let hello: Hello = read_json_message(&mut stream).await?;
+
+    match security.verify_peer(&hello.source_name, &hello.identity_public_key)? {
+        TrustOutcome::Trusted => {}
+        TrustOutcome::Untrusted { machine_name: peer_name, .. } => {
+            let Some(prompt) = pairing_prompt.as_ref() else {
+                bail!("sender {peer_name} is not trusted yet; fingerprint confirmation is required");
+            };
+            let fingerprint = pairing_fingerprint(local_public_key, &hello.identity_public_key)?;
+            let pairing_required = PairingRequired {
+                target_name: host_name(),
+                identity_public_key: local_public_key.to_string(),
+            };
+            write_json_message(&mut stream, &pairing_required).await?;
+            let approved = prompt(PairingRequest {
+                peer_name: peer_name.clone(),
+                fingerprint: fingerprint.clone(),
+                role: "sender".to_string(),
+            })?;
+            if !approved {
+                bail!("pairing rejected for sender {peer_name}");
+            }
+            let decision: PairingDecision = read_json_message(&mut stream).await?;
+            if !decision.approved {
+                bail!("sender {peer_name} rejected the fingerprint confirmation");
+            }
+            security.trust_peer(&peer_name, &hello.identity_public_key)?;
+            status(format!("Trusted sender {peer_name} with fingerprint {fingerprint}."));
+        }
+    }
+
+    let session_cipher = SessionCipher::new(
+        local_identity
+            .derive_session_key(&hello.identity_public_key)
+            .context("failed to derive receiver session key")?,
+    );
+
+    let accept = Accept {
+        target_name: host_name(),
+        audio_port,
+        identity_public_key: local_public_key.to_string(),
+    };
+    write_json_message(&mut stream, &accept).await?;
+    let stream_id = hello.stream_id;
+    let sender_name = hello.source_name.clone();
+    let sample_rate_hz = hello.sample_rate_hz;
+
+    let _ = event_tx.send(ReceiverControlEvent::Connected {
+        stream_id,
+        sender_name: sender_name.clone(),
+        sample_rate_hz,
+        session_cipher,
+    });
+    status(format!("Sender {sender_name} connected from {peer_addr}."));
+
+    let (mut control_read, _) = stream.into_split();
+    tokio::spawn(async move {
+        loop {
+            match poll_control_channel(&mut control_read).await {
+                Ok(ControlChannelState::Alive) => time::sleep(Duration::from_millis(50)).await,
+                Ok(ControlChannelState::Closed) | Err(_) => {
+                    let _ = event_tx.send(ReceiverControlEvent::Disconnected { stream_id });
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn mix_receiver_streams(
+    streams: &mut HashMap<u64, ReceiverStreamState>,
+    output_frame_samples: usize,
+    status: &StatusSink,
+) -> Option<Vec<i16>> {
+    let mut mix_accum = vec![0_i32; output_frame_samples];
+    let mut active_streams = 0_i32;
+    let stream_ids = streams.keys().copied().collect::<Vec<_>>();
+
+    for stream_id in stream_ids {
+        let Some(stream) = streams.get_mut(&stream_id) else {
+            continue;
+        };
+        let Some(samples) = next_receiver_stream_samples(stream, output_frame_samples, status) else {
+            continue;
+        };
+
+        for (index, sample) in samples.into_iter().enumerate() {
+            mix_accum[index] += sample as i32;
+        }
+        active_streams += 1;
+    }
+
+    if active_streams == 0 {
+        return None;
+    }
+
+    Some(
+        mix_accum
+            .into_iter()
+            .map(|value| (value / active_streams).clamp(i16::MIN as i32, i16::MAX as i32) as i16)
+            .collect(),
+    )
+}
+
+fn next_receiver_stream_samples(
+    stream: &mut ReceiverStreamState,
+    output_frame_samples: usize,
+    status: &StatusSink,
+) -> Option<Vec<i16>> {
+    if !stream.jitter_primed {
+        if stream.buffered_frames.len() >= stream.jitter_target_frames {
+            if let Some((&first_sequence, _)) = stream.buffered_frames.first_key_value() {
+                stream.next_play_sequence = Some(first_sequence);
+                stream.jitter_primed = true;
+                status(format!(
+                    "Jitter buffer primed with {} frames for {}.",
+                    stream.buffered_frames.len(),
+                    stream.sender_name
+                ));
+            }
+        } else {
+            return None;
+        }
+    }
+
+    let play_sequence = stream.next_play_sequence.get_or_insert(0);
+    let output = if let Some(samples) = stream.buffered_frames.remove(play_sequence) {
+        stream.last_good_output.clone_from(&samples);
+        stream.consecutive_missing_frames = 0;
+        samples
+    } else if let Some((&first_available, _)) = stream.buffered_frames.first_key_value() {
+        if first_available > *play_sequence {
+            stream.missing_packets += 1;
+            stream.underrun_frames += 1;
+            stream.consecutive_missing_frames += 1;
+            if stream.jitter_target_frames < JITTER_BUFFER_MAX_TARGET_FRAMES {
+                stream.jitter_target_frames = (stream.jitter_target_frames + 1).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
+            }
+            stream.stable_played_frames = 0;
+
+            if stream.consecutive_missing_frames >= CONSECUTIVE_MISSING_REBUFFER_THRESHOLD {
+                stream.jitter_primed = false;
+                stream.consecutive_missing_frames = 0;
+                stream.next_play_sequence = stream.buffered_frames.first_key_value().map(|(&sequence, _)| sequence);
+                status(format!(
+                    "Receiver rebuffering {} after packet loss. New target {} frames.",
+                    stream.sender_name,
+                    stream.jitter_target_frames
+                ));
+                return None;
+            }
+
+            if stream.consecutive_missing_frames <= 2 {
+                stream.last_good_output.clone()
+            } else {
+                vec![0_i16; output_frame_samples]
+            }
+        } else {
+            return None;
+        }
+    } else {
+        stream.jitter_primed = false;
+        stream.consecutive_missing_frames = 0;
+        return None;
+    };
+
+    *play_sequence += 1;
+    stream.played_frames += 1;
+    stream.stable_played_frames += 1;
+    if stream.stable_played_frames >= 250
+        && stream.jitter_target_frames > JITTER_BUFFER_MIN_TARGET_FRAMES
+        && stream.buffered_frames.len() >= stream.jitter_target_frames
+    {
+        stream.jitter_target_frames -= 1;
+        stream.stable_played_frames = 0;
+    }
+
+    Some(output)
+}
+
+fn receiver_metrics_summary(
+    streams: &HashMap<u64, ReceiverStreamState>,
+    player: &crate::audio::OutputPlayer,
+    device_name: &str,
+) -> String {
+    let sender_summary = if streams.is_empty() {
+        "none".to_string()
+    } else {
+        streams
+            .values()
+            .map(|stream| stream.sender_name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let total_network_frames: usize = streams.values().map(|stream| stream.buffered_frames.len()).sum();
+    let total_received: u64 = streams.values().map(|stream| stream.received_frames).sum();
+    let total_played: u64 = streams.values().map(|stream| stream.played_frames).sum();
+    let total_missing: u64 = streams.values().map(|stream| stream.missing_packets).sum();
+    let total_late: u64 = streams.values().map(|stream| stream.late_packets).sum();
+    let total_reordered: u64 = streams.values().map(|stream| stream.reordered_packets).sum();
+    let total_dropped: u64 = streams.values().map(|stream| stream.dropped_frames).sum();
+    let total_underruns: u64 = streams.values().map(|stream| stream.underrun_frames).sum();
+    let audio_queue_frames = player.buffered_sample_count() / frame_sample_count(player.sample_rate_hz()).max(1);
+
+    format!(
+        "Mode: Receiver\nState: Streaming\nActive streams: {}\nSenders: {}\nPlayback device: {}\nFrames: received {}, played {}\nLatency estimate: {} ms total ({} ms network + {} ms audio)\nNetwork buffer: {} frames\nAudio queue: {} frames\nLoss: missing {}, late {}, reordered {}, dropped {}, underruns {}",
+        streams.len(),
+        sender_summary,
+        device_name,
+        total_received,
+        total_played,
+        total_network_frames * 10 + audio_queue_frames * 10,
+        total_network_frames * 10,
+        audio_queue_frames * 10,
+        total_network_frames,
+        audio_queue_frames,
+        total_missing,
+        total_late,
+        total_reordered,
+        total_dropped,
+        total_underruns,
+    )
+}
+
+fn random_stream_id() -> Result<u64> {
+    let mut bytes = [0_u8; 8];
+    random_fill(&mut bytes).map_err(|error| anyhow::anyhow!("failed to generate stream id: {error}"))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn resample_stereo_i16(
