@@ -439,16 +439,18 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source(selected_source);
-        let native_rate_hz = detect_source_sample_rate(monitor_source.as_deref());
+        let native_spec = detect_source_spec(monitor_source.as_deref());
+        let native_rate_hz = native_spec.as_ref().map(|spec| spec.sample_rate_hz);
         let sample_rate_hz = native_rate_hz.unwrap_or(SAMPLE_RATE_HZ);
         eprintln!(
-            "linux system capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
+            "linux system capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, native_format={:?}",
             monitor_source,
-            sample_rate_hz
+            sample_rate_hz,
+            native_spec.as_ref().map(|spec| spec.sample_format)
         );
         let mut last_error = None;
 
-        for candidate in launch_candidates(&monitor_source, native_rate_hz) {
+        for candidate in launch_candidates(&monitor_source, native_spec.as_ref()) {
             match spawn_capture_process(&candidate) {
                 Ok(mut child) => {
                     let stdout = child
@@ -461,17 +463,18 @@ mod platform {
                         .name("velin-linux-capture".to_string())
                         .spawn(move || {
                             let mut stdout = stdout;
-                            let mut bytes =
-                                vec![0_u8; samples_per_10ms(candidate_rate_hz) * CHANNELS as usize * 2];
+                            let mut bytes = vec![
+                                0_u8;
+                                samples_per_10ms(candidate_rate_hz)
+                                    * CHANNELS as usize
+                                    * candidate.sample_format.bytes_per_sample()
+                            ];
                             loop {
                                 if stdout.read_exact(&mut bytes).is_err() {
                                     break;
                                 }
 
-                                let mut samples = Vec::with_capacity(bytes.len() / 2);
-                                for chunk in bytes.chunks_exact(2) {
-                                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-                                }
+                                let samples = decode_capture_bytes(&bytes, candidate.sample_format);
 
                                 if sender.send(samples).is_err() {
                                     break;
@@ -553,16 +556,18 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
         let microphone_source = detect_microphone_source(selected_source);
-        let native_rate_hz = detect_source_sample_rate(microphone_source.as_deref());
+        let native_spec = detect_source_spec(microphone_source.as_deref());
+        let native_rate_hz = native_spec.as_ref().map(|spec| spec.sample_rate_hz);
         let sample_rate_hz = native_rate_hz.unwrap_or(SAMPLE_RATE_HZ);
         eprintln!(
-            "linux microphone capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
+            "linux microphone capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, native_format={:?}",
             microphone_source,
-            sample_rate_hz
+            sample_rate_hz,
+            native_spec.as_ref().map(|spec| spec.sample_format)
         );
         let mut last_error = None;
 
-        for candidate in microphone_launch_candidates(&microphone_source, native_rate_hz) {
+        for candidate in microphone_launch_candidates(&microphone_source, native_spec.as_ref()) {
             match spawn_capture_process(&candidate) {
                 Ok(mut child) => {
                     let stdout = child
@@ -575,17 +580,18 @@ mod platform {
                         .name("velin-linux-microphone".to_string())
                         .spawn(move || {
                             let mut stdout = stdout;
-                            let mut bytes =
-                                vec![0_u8; samples_per_10ms(candidate_rate_hz) * CHANNELS as usize * 2];
+                            let mut bytes = vec![
+                                0_u8;
+                                samples_per_10ms(candidate_rate_hz)
+                                    * CHANNELS as usize
+                                    * candidate.sample_format.bytes_per_sample()
+                            ];
                             loop {
                                 if stdout.read_exact(&mut bytes).is_err() {
                                     break;
                                 }
 
-                                let mut samples = Vec::with_capacity(bytes.len() / 2);
-                                for chunk in bytes.chunks_exact(2) {
-                                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-                                }
+                                let samples = decode_capture_bytes(&bytes, candidate.sample_format);
 
                                 if sender.send(samples).is_err() {
                                     break;
@@ -616,9 +622,43 @@ mod platform {
         args: Vec<String>,
         description: String,
         sample_rate_hz: u32,
+        sample_format: LinuxPcmFormat,
     }
 
-    fn launch_candidates(monitor_source: &Option<String>, native_rate_hz: Option<u32>) -> Vec<CaptureCommand> {
+    #[derive(Clone, Copy, Debug)]
+    enum LinuxPcmFormat {
+        S16Le,
+        S32Le,
+        Float32Le,
+    }
+
+    impl LinuxPcmFormat {
+        fn parec_name(self) -> &'static str {
+            match self {
+                Self::S16Le => "s16le",
+                Self::S32Le => "s32le",
+                Self::Float32Le => "float32le",
+            }
+        }
+
+        fn bytes_per_sample(self) -> usize {
+            match self {
+                Self::S16Le => 2,
+                Self::S32Le | Self::Float32Le => 4,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct LinuxSourceSpec {
+        sample_rate_hz: u32,
+        sample_format: LinuxPcmFormat,
+    }
+
+    fn launch_candidates(
+        monitor_source: &Option<String>,
+        native_spec: Option<&LinuxSourceSpec>,
+    ) -> Vec<CaptureCommand> {
         let mut candidates = Vec::new();
         let mut sources = Vec::new();
 
@@ -630,21 +670,25 @@ mod platform {
         }
 
         for source in sources {
-            if let Some(rate_hz) = native_rate_hz {
+            if let Some(spec) = native_spec {
                 candidates.push(CaptureCommand {
                     program: "parec",
                     args: vec![
                         format!("--device={source}"),
                         "--raw".to_string(),
-                        "--format=s16le".to_string(),
-                        "--fix-format".to_string(),
+                        format!("--format={}", spec.sample_format.parec_name()),
                         "--fix-channels".to_string(),
                         "--latency-msec=20".to_string(),
-                        format!("--rate={rate_hz}"),
+                        format!("--rate={}", spec.sample_rate_hz),
                         "--channels=2".to_string(),
                     ],
-                    description: format!("parec monitor source {source} @ native {rate_hz} Hz"),
-                    sample_rate_hz: rate_hz,
+                    description: format!(
+                        "parec monitor source {source} @ native {} {}",
+                        spec.sample_rate_hz,
+                        spec.sample_format.parec_name()
+                    ),
+                    sample_rate_hz: spec.sample_rate_hz,
+                    sample_format: spec.sample_format,
                 });
             }
 
@@ -663,13 +707,17 @@ mod platform {
                 ],
                 description: format!("parec monitor source {source} @ fallback {SAMPLE_RATE_HZ} Hz"),
                 sample_rate_hz: SAMPLE_RATE_HZ,
+                sample_format: LinuxPcmFormat::S16Le,
             });
         }
 
         candidates
     }
 
-    fn microphone_launch_candidates(source: &Option<String>, native_rate_hz: Option<u32>) -> Vec<CaptureCommand> {
+    fn microphone_launch_candidates(
+        source: &Option<String>,
+        native_spec: Option<&LinuxSourceSpec>,
+    ) -> Vec<CaptureCommand> {
         let mut candidates = Vec::new();
         let mut sources = Vec::new();
 
@@ -681,21 +729,25 @@ mod platform {
         }
 
         for source in sources {
-            if let Some(rate_hz) = native_rate_hz {
+            if let Some(spec) = native_spec {
                 candidates.push(CaptureCommand {
                     program: "parec",
                     args: vec![
                         format!("--device={source}"),
                         "--raw".to_string(),
-                        "--format=s16le".to_string(),
-                        "--fix-format".to_string(),
+                        format!("--format={}", spec.sample_format.parec_name()),
                         "--fix-channels".to_string(),
                         "--latency-msec=20".to_string(),
-                        format!("--rate={rate_hz}"),
+                        format!("--rate={}", spec.sample_rate_hz),
                         "--channels=2".to_string(),
                     ],
-                    description: format!("parec microphone source {source} @ native {rate_hz} Hz"),
-                    sample_rate_hz: rate_hz,
+                    description: format!(
+                        "parec microphone source {source} @ native {} {}",
+                        spec.sample_rate_hz,
+                        spec.sample_format.parec_name()
+                    ),
+                    sample_rate_hz: spec.sample_rate_hz,
+                    sample_format: spec.sample_format,
                 });
             }
 
@@ -714,6 +766,7 @@ mod platform {
                 ],
                 description: format!("parec microphone source {source} @ fallback {SAMPLE_RATE_HZ} Hz"),
                 sample_rate_hz: SAMPLE_RATE_HZ,
+                sample_format: LinuxPcmFormat::S16Le,
             });
         }
 
@@ -821,14 +874,14 @@ mod platform {
         None
     }
 
-    fn detect_source_sample_rate(selected_source: Option<&str>) -> Option<u32> {
+    fn detect_source_spec(selected_source: Option<&str>) -> Option<LinuxSourceSpec> {
         let source_name = selected_source?.trim();
         if source_name.is_empty() {
             return None;
         }
 
-        if let Some(rate_hz) = detect_source_sample_rate_short(source_name) {
-            return Some(rate_hz);
+        if let Some(spec) = detect_source_spec_short(source_name) {
+            return Some(spec);
         }
 
         let output = Command::new("pactl").args(["list", "sources"]).output().ok()?;
@@ -848,9 +901,9 @@ mod platform {
 
             if current_name == Some(source_name) {
                 if let Some(spec) = trimmed.strip_prefix("Sample Specification:") {
-                    let parsed = parse_sample_rate_from_spec(spec.trim());
+                    let parsed = parse_source_spec(spec.trim());
                     eprintln!(
-                        "linux source spec (verbose): name={source_name}, spec={:?}, parsed_rate={parsed:?}",
+                        "linux source spec (verbose): name={source_name}, spec={:?}, parsed={parsed:?}",
                         spec.trim()
                     );
                     return parsed;
@@ -858,11 +911,11 @@ mod platform {
             }
         }
 
-        eprintln!("linux source spec: no sample rate match found for {source_name}");
+        eprintln!("linux source spec: no match found for {source_name}");
         None
     }
 
-    fn detect_source_sample_rate_short(source_name: &str) -> Option<u32> {
+    fn detect_source_spec_short(source_name: &str) -> Option<LinuxSourceSpec> {
         let output = Command::new("pactl")
             .args(["list", "short", "sources"])
             .output()
@@ -878,9 +931,9 @@ mod platform {
             }
 
             let sample_spec = columns[3].trim();
-            let parsed = parse_sample_rate_from_spec(sample_spec);
+            let parsed = parse_source_spec(sample_spec);
             eprintln!(
-                "linux source spec (short): name={source_name}, spec={sample_spec:?}, parsed_rate={parsed:?}"
+                "linux source spec (short): name={source_name}, spec={sample_spec:?}, parsed={parsed:?}"
             );
             return parsed;
         }
@@ -888,15 +941,55 @@ mod platform {
         None
     }
 
-    fn parse_sample_rate_from_spec(spec: &str) -> Option<u32> {
+    fn parse_source_spec(spec: &str) -> Option<LinuxSourceSpec> {
+        let mut sample_rate_hz = None;
+        let mut sample_format = None;
+
         for token in spec.split_whitespace() {
             if let Some(rate) = token.strip_suffix("Hz") {
                 if let Ok(parsed) = rate.parse::<u32>() {
-                    return Some(parsed);
+                    sample_rate_hz = Some(parsed);
                 }
             }
+            sample_format = sample_format.or_else(|| parse_sample_format(token));
         }
-        None
+
+        Some(LinuxSourceSpec {
+            sample_rate_hz: sample_rate_hz?,
+            sample_format: sample_format.unwrap_or(LinuxPcmFormat::S16Le),
+        })
+    }
+
+    fn parse_sample_format(token: &str) -> Option<LinuxPcmFormat> {
+        match token {
+            "s16le" => Some(LinuxPcmFormat::S16Le),
+            "s32le" => Some(LinuxPcmFormat::S32Le),
+            "float32le" | "f32le" => Some(LinuxPcmFormat::Float32Le),
+            _ => None,
+        }
+    }
+
+    fn decode_capture_bytes(bytes: &[u8], sample_format: LinuxPcmFormat) -> Vec<i16> {
+        match sample_format {
+            LinuxPcmFormat::S16Le => bytes
+                .chunks_exact(2)
+                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect(),
+            LinuxPcmFormat::S32Le => bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    (sample >> 16) as i16
+                })
+                .collect(),
+            LinuxPcmFormat::Float32Le => bytes
+                .chunks_exact(4)
+                .map(|chunk| {
+                    let sample = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                })
+                .collect(),
+        }
     }
 
     fn samples_per_10ms(sample_rate_hz: u32) -> usize {
