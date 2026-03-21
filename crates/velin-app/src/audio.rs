@@ -36,7 +36,7 @@ pub struct OutputPlayer {
 enum OutputBackend {
     Cpal { _stream: Stream },
     #[cfg(target_os = "linux")]
-    LinuxPipe(LinuxPipeBackend),
+    LinuxPipe { _pipe: LinuxPipeBackend },
 }
 
 #[cfg(target_os = "linux")]
@@ -252,10 +252,12 @@ fn open_linux_pipe_output_device() -> Result<OutputPlayer> {
         .context("failed to spawn Linux output writer thread")?;
 
     Ok(OutputPlayer {
-        _backend: OutputBackend::LinuxPipe(LinuxPipeBackend {
-            child,
-            thread: Some(thread),
-        }),
+        _backend: OutputBackend::LinuxPipe {
+            _pipe: LinuxPipeBackend {
+                child,
+                thread: Some(thread),
+            },
+        },
         buffer,
         muted,
         backend_error,
