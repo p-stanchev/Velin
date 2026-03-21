@@ -20,6 +20,7 @@ pub struct OutputPlayer {
     _stream: Stream,
     buffer: Arc<Mutex<PlaybackBuffer>>,
     muted: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
     config_summary: String,
     sample_rate_hz: u32,
 }
@@ -39,6 +40,10 @@ impl OutputPlayer {
 
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn take_backend_error(&self) -> bool {
+        self.backend_error.swap(false, Ordering::Relaxed)
     }
 
     pub fn config_summary(&self) -> &str {
@@ -94,6 +99,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
     let output_channels = stream_config.channels as usize;
     let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
     let muted = Arc::new(AtomicBool::new(false));
+    let backend_error = Arc::new(AtomicBool::new(false));
     let (stream, config_summary, sample_rate_hz) = match build_stream(
         &device,
         &stream_config,
@@ -101,6 +107,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
         output_channels,
         Arc::clone(&buffer),
         Arc::clone(&muted),
+        Arc::clone(&backend_error),
     ) {
         Ok(stream) => (
             stream,
@@ -123,6 +130,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
                 fallback_channels,
                 Arc::clone(&buffer),
                 Arc::clone(&muted),
+                Arc::clone(&backend_error),
             )
             .with_context(|| format!("failed to build output stream with tuned config: {primary_error:#}"))?;
 
@@ -147,6 +155,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
             _stream: stream,
             buffer,
             muted,
+            backend_error,
             config_summary,
             sample_rate_hz,
         },
@@ -212,8 +221,12 @@ fn build_stream(
     output_channels: usize,
     buffer: Arc<Mutex<PlaybackBuffer>>,
     muted: Arc<AtomicBool>,
+    backend_error: Arc<AtomicBool>,
 ) -> Result<Stream> {
-    let error_callback = |error| eprintln!("audio output stream error: {error}");
+    let error_callback = move |error| {
+        backend_error.store(true, Ordering::Relaxed);
+        eprintln!("audio output stream error: {error}");
+    };
 
     match sample_format {
         SampleFormat::I8 => build_stream_for_format::<i8>(device, config, output_channels, buffer, muted, error_callback),

@@ -69,7 +69,7 @@ pub async fn run_target(
     let audio_socket = UdpSocket::bind(&audio_addr)
         .await
         .with_context(|| format!("failed to bind audio socket on {audio_addr}"))?;
-    let (player, device_name) = open_output_device(&config.output_device_name)
+    let (mut player, mut device_name) = open_output_device(&config.output_device_name)
         .context("failed to open playback device")?;
     let discovery_status = Arc::clone(&status);
     let discovery_bind_ip = bind_ip.clone();
@@ -133,7 +133,7 @@ pub async fn run_target(
     };
     write_json_message(&mut stream, &accept).await?;
 
-    let output_frame_samples = frame_sample_count(player.sample_rate_hz());
+    let mut output_frame_samples = frame_sample_count(player.sample_rate_hz());
     let mut packet = vec![0_u8; 2048];
     let mut received_frames = 0_u64;
     let started = Instant::now();
@@ -142,7 +142,7 @@ pub async fn run_target(
     let mut buffered_frames = BTreeMap::<u64, Vec<i16>>::new();
     let mut next_play_sequence = None;
     let mut jitter_primed = false;
-    let silence_frame = vec![0_i16; output_frame_samples];
+    let mut silence_frame = vec![0_i16; output_frame_samples];
     let mut played_frames = 0_u64;
     let mut dropped_frames = 0_u64;
     let mut underrun_frames = 0_u64;
@@ -156,6 +156,7 @@ pub async fn run_target(
     let mut depth_sum = 0_u64;
     let mut last_good_output = silence_frame.clone();
     let mut consecutive_missing_frames = 0_u64;
+    let mut last_restart_attempt = Instant::now() - Duration::from_secs(5);
 
     loop {
         tokio::select! {
@@ -222,6 +223,36 @@ pub async fn run_target(
                 depth_samples += 1;
             }
             _ = playback_tick.tick() => {
+                if player.take_backend_error() && last_restart_attempt.elapsed() >= Duration::from_secs(1) {
+                    last_restart_attempt = Instant::now();
+                    status("Playback backend fault detected. Reopening output stream...".to_string());
+                    match open_output_device(&config.output_device_name) {
+                        Ok((next_player, next_device_name)) => {
+                            player = next_player;
+                            device_name = next_device_name;
+                            output_frame_samples = frame_sample_count(player.sample_rate_hz());
+                            silence_frame = vec![0_i16; output_frame_samples];
+                            last_good_output = silence_frame.clone();
+                            jitter_primed = false;
+                            consecutive_missing_frames = 0;
+                            player.clear_buffer();
+                            status(format!("Playback stream reopened on {device_name}."));
+                            status(format!("Playback config: {}.", player.config_summary()));
+                            emit_metrics(
+                                &metrics,
+                                format!(
+                                    "Mode: Receiver\nState: Recovering\nSender: {}\nPlayback device: {device_name}\nPlayback config: {}\nAction: Output stream restarted after backend fault",
+                                    hello.source_name,
+                                    player.config_summary()
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            status(format!("Playback restart failed. {error:#}"));
+                        }
+                    }
+                }
+
                 if !jitter_primed {
                     continue;
                 }
