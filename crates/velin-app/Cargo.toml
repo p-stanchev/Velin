@@ -33,6 +33,7 @@ depends = "$auto, pulseaudio-utils, alsa-utils"
 section = "sound"
 priority = "optional"
 assets = [
+    ["../../target/release/velin-app", "usr/bin/velin-app", "755"],
     ["../../README.md", "usr/share/doc/velin-app/README.md", "644"],
     ["../../LICENSE", "usr/share/doc/velin-app/LICENSE", "644"],
     ["../../assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/velin.svg", "644"],
