@@ -138,8 +138,11 @@ mod platform {
                     format!("--device={source}"),
                     "--raw".to_string(),
                     "--format=s16le".to_string(),
+                    "--fix-format".to_string(),
                     "--rate=48000".to_string(),
+                    "--fix-rate".to_string(),
                     "--channels=2".to_string(),
+                    "--fix-channels".to_string(),
                 ],
                 description: format!("parec monitor source {source}"),
             });
