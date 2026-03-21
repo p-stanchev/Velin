@@ -19,11 +19,13 @@ use velin_proto::{
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
 pub type MetricsSink = Arc<dyn Fn(String) + Send + Sync>;
-const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 6;
-const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 12;
+const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 2;
+const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 4;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
-const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 40;
+const JITTER_BUFFER_MAX_TARGET_FRAMES: usize = 12;
 const CONSECUTIVE_MISSING_REBUFFER_THRESHOLD: u64 = 4;
+const PLAYBACK_QUEUE_TARGET_FRAMES: usize = 3;
+const PLAYBACK_QUEUE_LOW_WATER_FRAMES: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -208,8 +210,8 @@ pub async fn run_target(
                     continue;
                 }
 
-                let low_water_samples = (jitter_target_frames.max(2) / 2).max(2) * output_frame_samples;
-                let target_samples = jitter_target_frames * output_frame_samples;
+                let low_water_samples = PLAYBACK_QUEUE_LOW_WATER_FRAMES * output_frame_samples;
+                let target_samples = PLAYBACK_QUEUE_TARGET_FRAMES * output_frame_samples;
 
                 if player.buffered_sample_count() > low_water_samples {
                     continue;
@@ -234,7 +236,7 @@ pub async fn run_target(
                                 player.push_samples(&silence_frame);
                             }
                             if jitter_target_frames < JITTER_BUFFER_MAX_TARGET_FRAMES {
-                                jitter_target_frames = (jitter_target_frames + 2).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
+                                jitter_target_frames = (jitter_target_frames + 1).min(JITTER_BUFFER_MAX_TARGET_FRAMES);
                             }
                             stable_played_frames = 0;
 
@@ -273,7 +275,7 @@ pub async fn run_target(
 
                 if queued_any {
                     stable_played_frames += 1;
-                    if stable_played_frames >= 400
+                    if stable_played_frames >= 250
                         && jitter_target_frames > JITTER_BUFFER_MIN_TARGET_FRAMES
                         && buffered_frames.len() >= jitter_target_frames
                     {
@@ -289,21 +291,26 @@ pub async fn run_target(
                     } else {
                         depth_sum as f32 / depth_samples as f32
                     };
+                    let audio_queue_frames = player.buffered_sample_count() / output_frame_samples;
+                    let network_latency_ms = buffered_frames.len() * 10;
+                    let audio_latency_ms = audio_queue_frames * 10;
                     status(format!(
                         "Received {received_frames} frames, played {played_frames}, late {late_packets}, reordered {reordered_packets}, missing {missing_packets}, underruns {underrun_frames}, dropped {dropped_frames}, target {jitter_target_frames}, avg buffer {average_depth:.1}, net buffer {}, audio queue {} in {seconds:.1}s.",
                         buffered_frames.len(),
-                        player.buffered_sample_count() / output_frame_samples
+                        audio_queue_frames
                     ));
                     emit_metrics(
                         &metrics,
                         format!(
-                            "Mode: Receiver\nState: Streaming\nSender: {}\nSource: {} Hz -> Playback: {} Hz\nFrames: received {received_frames}, played {played_frames}\nLatency estimate: {} ms\nNetwork buffer: {} frames\nAudio queue: {} frames\nJitter target: {} frames\nLoss: missing {missing_packets}, late {late_packets}, reordered {reordered_packets}, dropped {dropped_frames}, underruns {underrun_frames}\nAverage network buffer: {:.1} frames\nUptime: {:.1}s",
+                            "Mode: Receiver\nState: Streaming\nSender: {}\nSource: {} Hz -> Playback: {} Hz\nFrames: received {received_frames}, played {played_frames}\nLatency estimate: {} ms total ({} ms network + {} ms audio)\nNetwork buffer: {} frames\nAudio queue: {} frames\nJitter target: {} frames\nLoss: missing {missing_packets}, late {late_packets}, reordered {reordered_packets}, dropped {dropped_frames}, underruns {underrun_frames}\nAverage network buffer: {:.1} frames\nUptime: {:.1}s",
                             hello.source_name,
                             hello.sample_rate_hz,
                             player.sample_rate_hz(),
-                            ((buffered_frames.len() + (player.buffered_sample_count() / output_frame_samples)) * 10),
+                            network_latency_ms + audio_latency_ms,
+                            network_latency_ms,
+                            audio_latency_ms,
                             buffered_frames.len(),
-                            player.buffered_sample_count() / output_frame_samples,
+                            audio_queue_frames,
                             jitter_target_frames,
                             average_depth,
                             seconds
