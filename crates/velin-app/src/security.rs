@@ -6,9 +6,11 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const SECURITY_CONTEXT: &[u8] = b"velin-session-v1";
+const DEFAULT_TRUST_VALIDITY_DAYS: u32 = 30;
 
 #[derive(Clone)]
 pub struct LocalIdentity {
@@ -19,6 +21,15 @@ pub struct LocalIdentity {
 pub struct TrustedPeer {
     pub machine_name: String,
     pub public_key_hex: String,
+    #[serde(default = "now_unix_secs")]
+    pub trusted_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedPeerView {
+    pub machine_name: String,
+    pub fingerprint: String,
+    pub expires_in_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +37,7 @@ pub struct TrustedPeer {
 struct SecurityStoreData {
     local_secret_hex: String,
     trusted_peers: Vec<TrustedPeer>,
+    trust_validity_days: u32,
 }
 
 impl Default for SecurityStoreData {
@@ -33,6 +45,7 @@ impl Default for SecurityStoreData {
         Self {
             local_secret_hex: String::new(),
             trusted_peers: Vec::new(),
+            trust_validity_days: DEFAULT_TRUST_VALIDITY_DAYS,
         }
     }
 }
@@ -88,6 +101,7 @@ impl SecurityStore {
 
         let public_key_hex = public_key_hex.trim().to_lowercase();
         let _ = public_key_from_hex(&public_key_hex)?;
+        self.prune_expired_peers();
 
         if let Some(peer) = self
             .data
@@ -130,10 +144,59 @@ impl SecurityStore {
         self.data.trusted_peers.push(TrustedPeer {
             machine_name: machine_name.to_string(),
             public_key_hex,
+            trusted_at_unix_secs: now_unix_secs(),
         });
         self.data
             .trusted_peers
             .sort_by(|left, right| left.machine_name.cmp(&right.machine_name));
+        self.save()
+    }
+
+    pub fn trust_validity_days(&self) -> u32 {
+        self.data.trust_validity_days.max(1)
+    }
+
+    pub fn set_trust_validity_days(&mut self, days: u32) -> Result<()> {
+        self.data.trust_validity_days = days.max(1);
+        self.prune_expired_peers();
+        self.save()
+    }
+
+    pub fn trusted_peer_views(&mut self) -> Result<Vec<TrustedPeerView>> {
+        self.prune_expired_peers();
+        let validity_days = self.trust_validity_days();
+        let now = now_unix_secs();
+        let mut peers = self
+            .data
+            .trusted_peers
+            .iter()
+            .map(|peer| TrustedPeerView {
+                machine_name: peer.machine_name.clone(),
+                fingerprint: public_key_fingerprint(&peer.public_key_hex).unwrap_or_else(|_| "Invalid fingerprint".to_string()),
+                expires_in_days: expiry_remaining_days(peer.trusted_at_unix_secs, validity_days, now),
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by(|left, right| left.machine_name.cmp(&right.machine_name));
+        Ok(peers)
+    }
+
+    pub fn remove_trusted_peer_by_fingerprint(&mut self, fingerprint: &str) -> Result<bool> {
+        let normalized = fingerprint.trim().to_uppercase();
+        let before = self.data.trusted_peers.len();
+        self.data.trusted_peers.retain(|peer| {
+            public_key_fingerprint(&peer.public_key_hex)
+                .map(|value| value != normalized)
+                .unwrap_or(true)
+        });
+        let removed = self.data.trusted_peers.len() != before;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn clear_trusted_peers(&mut self) -> Result<()> {
+        self.data.trusted_peers.clear();
         self.save()
     }
 
@@ -149,6 +212,14 @@ impl SecurityStore {
         fs::write(&self.path, bytes)
             .with_context(|| format!("failed to write security file {}", self.path.display()))
     }
+
+    fn prune_expired_peers(&mut self) {
+        let validity_days = self.trust_validity_days();
+        let now = now_unix_secs();
+        self.data
+            .trusted_peers
+            .retain(|peer| !is_expired(peer.trusted_at_unix_secs, validity_days, now));
+    }
 }
 
 pub fn pairing_fingerprint(local_public_key_hex: &str, peer_public_key_hex: &str) -> Result<String> {
@@ -159,6 +230,12 @@ pub fn pairing_fingerprint(local_public_key_hex: &str, peer_public_key_hex: &str
     parts.sort();
     let combined = [parts[0].as_slice(), parts[1].as_slice()].concat();
     let digest = Sha256::digest(combined);
+    Ok(format_fingerprint(&digest[..16]))
+}
+
+pub fn public_key_fingerprint(public_key_hex: &str) -> Result<String> {
+    let bytes = hex::decode(public_key_hex.trim()).context("invalid public key encoding")?;
+    let digest = Sha256::digest(bytes);
     Ok(format_fingerprint(&digest[..16]))
 }
 
@@ -206,6 +283,28 @@ fn random_secret_bytes() -> Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];
     random_fill(&mut bytes).map_err(|error| anyhow!("failed to generate local identity key: {error}"))?;
     Ok(bytes)
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_expired(trusted_at_unix_secs: u64, validity_days: u32, now_unix_secs: u64) -> bool {
+    let validity_secs = validity_days as u64 * 24 * 60 * 60;
+    now_unix_secs.saturating_sub(trusted_at_unix_secs) >= validity_secs
+}
+
+fn expiry_remaining_days(trusted_at_unix_secs: u64, validity_days: u32, now_unix_secs: u64) -> Option<u32> {
+    if is_expired(trusted_at_unix_secs, validity_days, now_unix_secs) {
+        return None;
+    }
+    let validity_secs = validity_days as u64 * 24 * 60 * 60;
+    let expires_at = trusted_at_unix_secs.saturating_add(validity_secs);
+    let remaining_secs = expires_at.saturating_sub(now_unix_secs);
+    Some(((remaining_secs + 86_399) / 86_400) as u32)
 }
 
 fn security_path() -> Result<PathBuf> {

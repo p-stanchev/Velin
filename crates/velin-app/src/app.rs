@@ -1,3 +1,4 @@
+use crate::security::SecurityStore;
 use crate::audio::{default_output_device_name, output_device_names};
 use crate::discovery::{DiscoveredPeer, DiscoveryAdvertiser, PeerUpdateSink, request_discovery, run_discovery_service};
 use crate::settings::{AppSettings, PreferredPeer, SettingsStore, ThemeMode};
@@ -32,6 +33,12 @@ struct SessionControls {
 struct PeerChoice {
     label: String,
     ip: String,
+}
+
+#[derive(Debug, Clone)]
+struct TrustedFingerprintChoice {
+    label: String,
+    fingerprint: String,
 }
 
 #[derive(Default)]
@@ -77,6 +84,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     let settings = Arc::new(Mutex::new(store.load_or_default()?));
     let discovered_peers = Arc::new(Mutex::new(Vec::<DiscoveredPeer>::new()));
     let peer_choices = Arc::new(Mutex::new(Vec::<PeerChoice>::new()));
+    let trusted_fingerprints = Arc::new(Mutex::new(Vec::<TrustedFingerprintChoice>::new()));
     let pairing_state = Arc::new(Mutex::new(PairingPromptState::default()));
     let discovery_advertiser = DiscoveryAdvertiser::default();
     let app = AppWindow::new().context("failed to create Slint app window")?;
@@ -108,6 +116,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.set_pairing_fingerprint("".into());
         app.set_pairing_role("".into());
         apply_peer_options(&app, &settings.lock().expect("settings poisoned"), &peer_choices, &[]);
+        refresh_security_settings(&app, &trusted_fingerprints)?;
     }
 
     {
@@ -171,6 +180,7 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     {
         let store = Arc::clone(&store);
         let settings = Arc::clone(&settings);
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
         let weak = app.as_weak();
         app.on_save_settings(move |target_ip, bind_ip_selection, output_device_selection, control_port, audio_port, dark_mode| {
             let target_ip = target_ip.to_string();
@@ -194,6 +204,10 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
                 Ok(next) => {
                     if let Err(error) = persist_settings(&store, &settings, &weak, &next) {
                         status(format!("Failed to save settings: {error:#}"));
+                    } else if let Some(app) = weak.upgrade() {
+                        if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+                            status(format!("Failed to refresh security settings: {error:#}"));
+                        }
                     }
                 }
                 Err(_) => {}
@@ -246,6 +260,85 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
         app.on_report_bug(move || {
             if let Err(error) = open_bug_report_page() {
                 set_status(&weak, format!("Failed to open bug report page. {error}"));
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
+        app.on_save_trust_validity(move |days| {
+            let status = ui_status_sink(&weak);
+            match days.trim().parse::<u32>() {
+                Ok(days) if days > 0 => {
+                    match SecurityStore::load_or_create().and_then(|mut store| store.set_trust_validity_days(days)) {
+                        Ok(()) => {
+                            if let Some(app) = weak.upgrade() {
+                                if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+                                    status(format!("Failed to refresh fingerprint settings: {error:#}"));
+                                } else {
+                                    status(format!("Fingerprint validity set to {days} days."));
+                                }
+                            }
+                        }
+                        Err(error) => status(format!("Failed to save fingerprint validity: {error:#}")),
+                    }
+                }
+                _ => status("Fingerprint validity must be a positive whole number of days.".to_string()),
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
+        app.on_clear_selected_fingerprint(move |label| {
+            let status = ui_status_sink(&weak);
+            let label = label.to_string();
+            let fingerprint = trusted_fingerprints
+                .lock()
+                .expect("trusted fingerprints poisoned")
+                .iter()
+                .find(|entry| entry.label == label)
+                .map(|entry| entry.fingerprint.clone());
+
+            let Some(fingerprint) = fingerprint else {
+                status("Select a fingerprint to clear.".to_string());
+                return;
+            };
+
+            match SecurityStore::load_or_create().and_then(|mut store| store.remove_trusted_peer_by_fingerprint(&fingerprint)) {
+                Ok(true) => {
+                    if let Some(app) = weak.upgrade() {
+                        if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+                            status(format!("Failed to refresh fingerprint settings: {error:#}"));
+                        } else {
+                            status(format!("Cleared fingerprint {fingerprint}."));
+                        }
+                    }
+                }
+                Ok(false) => status("Selected fingerprint was already missing.".to_string()),
+                Err(error) => status(format!("Failed to clear fingerprint: {error:#}")),
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
+        app.on_clear_all_fingerprints(move || {
+            let status = ui_status_sink(&weak);
+            match SecurityStore::load_or_create().and_then(|mut store| store.clear_trusted_peers()) {
+                Ok(()) => {
+                    if let Some(app) = weak.upgrade() {
+                        if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+                            status(format!("Failed to refresh fingerprint settings: {error:#}"));
+                        } else {
+                            status("Cleared all trusted fingerprints.".to_string());
+                        }
+                    }
+                }
+                Err(error) => status(format!("Failed to clear trusted fingerprints: {error:#}")),
             }
         });
     }
@@ -424,6 +517,64 @@ fn output_device_options() -> Vec<slint::SharedString> {
         options.extend(names.into_iter().map(slint::SharedString::from));
     }
     options
+}
+
+fn refresh_security_settings(
+    app: &AppWindow,
+    trusted_fingerprints: &Arc<Mutex<Vec<TrustedFingerprintChoice>>>,
+) -> Result<()> {
+    let mut security = SecurityStore::load_or_create()?;
+    let peers = security.trusted_peer_views()?;
+    let validity_days = security.trust_validity_days();
+
+    let choices = peers
+        .iter()
+        .map(|peer| TrustedFingerprintChoice {
+            label: format!(
+                "{} | {} | {}",
+                peer.machine_name,
+                peer.fingerprint,
+                peer.expires_in_days
+                    .map(|days| format!("{}d left", days))
+                    .unwrap_or_else(|| "expired".to_string())
+            ),
+            fingerprint: peer.fingerprint.clone(),
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut state = trusted_fingerprints
+            .lock()
+            .expect("trusted fingerprints poisoned");
+        *state = choices.clone();
+    }
+
+    let options = if choices.is_empty() {
+        vec![slint::SharedString::from("No trusted fingerprints")]
+    } else {
+        choices
+            .iter()
+            .map(|entry| slint::SharedString::from(entry.label.clone()))
+            .collect::<Vec<_>>()
+    };
+    let selection = options
+        .first()
+        .cloned()
+        .unwrap_or_else(|| slint::SharedString::from("No trusted fingerprints"));
+
+    app.set_trust_validity_days(validity_days.to_string().into());
+    app.set_trusted_fingerprint_options(ModelRc::new(VecModel::from(options)));
+    if app.get_trusted_fingerprint_selection().is_empty()
+        || app.get_trusted_fingerprint_selection() == "No trusted fingerprints"
+    {
+        app.set_trusted_fingerprint_selection(selection);
+    } else if !choices
+        .iter()
+        .any(|entry| app.get_trusted_fingerprint_selection() == entry.label)
+    {
+        app.set_trusted_fingerprint_selection(selection);
+    }
+
+    Ok(())
 }
 
 fn apply_peer_options(

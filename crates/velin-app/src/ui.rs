@@ -80,6 +80,7 @@ slint::slint! {
         in-out property <string> discovered-peer-selection: "No receivers found";
         in-out property <string> control-port: "49000";
         in-out property <string> audio-port: "49001";
+        in-out property <string> trust-validity-days: "30";
         in-out property <string> status-text: "Idle";
         in-out property <string> metrics-text: "No active stream.\n";
         in-out property <string> log-text: "";
@@ -87,6 +88,8 @@ slint::slint! {
         in-out property <string> pairing-peer-name: "";
         in-out property <string> pairing-fingerprint: "";
         in-out property <string> pairing-role: "";
+        in-out property <[string]> trusted-fingerprint-options: ["No trusted fingerprints"];
+        in-out property <string> trusted-fingerprint-selection: "No trusted fingerprints";
         in-out property <string> local-addresses: "Local IP unavailable";
         in-out property <string> local-machine-name: "Unknown";
         in-out property <string> local-primary-ip: "Unavailable";
@@ -107,14 +110,17 @@ slint::slint! {
         callback toggle-mute();
         callback refresh-discovery();
         callback save-settings(string, string, string, string, string, bool);
+        callback save-trust-validity(string);
         callback choose-discovered-peer(string);
+        callback clear-selected-fingerprint(string);
+        callback clear-all-fingerprints();
         callback pairing-decision(bool);
         callback report-bug();
 
         title: "Velin";
         icon: @image-url("../../assets/logo.svg");
         width: 680px;
-        height: 700px;
+        height: 820px;
 
         in property <color> bg: root.dark-mode ? #171717 : #f4f2ed;
         in property <color> panel-bg: root.dark-mode ? #1f1f1f : #fbfaf7;
@@ -592,7 +598,7 @@ slint::slint! {
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
-                    height: 344px;
+                    height: 640px;
 
                     VerticalBox {
                         padding: 18px;
@@ -805,6 +811,152 @@ slint::slint! {
                                     placeholder: "49001";
                                     edited => {
                                         root.save-settings(root.target-ip, root.bind-ip-selection, root.output-device-selection, root.control-port, root.audio-port, root.dark-mode);
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+                            height: 254px;
+
+                            VerticalBox {
+                                padding: 10px;
+                                spacing: 6px;
+
+                                Text {
+                                    text: "Security & Trust";
+                                    color: root.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+
+                                Text {
+                                    text: "Control how long trusted pairings stay valid and remove old fingerprints.";
+                                    color: root.text-secondary;
+                                    font-size: 11px;
+                                }
+
+                                HorizontalBox {
+                                    spacing: 12px;
+
+                                    VerticalBox {
+                                        spacing: 6px;
+                                        width: 200px;
+
+                                        Text {
+                                            text: "Fingerprint validity (days)";
+                                            color: root.text-tertiary;
+                                            font-size: 12px;
+                                        }
+
+                                        FlatInput {
+                                            text <=> root.trust-validity-days;
+                                            enabled: !root.running;
+                                            dark-mode: root.dark-mode;
+                                            placeholder: "30";
+                                            edited => {
+                                                root.save-trust-validity(root.trust-validity-days);
+                                            }
+                                        }
+                                    }
+
+                                    VerticalBox {
+                                        spacing: 8px;
+                                        width: 130px;
+                                        alignment: start;
+
+                                        Rectangle {
+                                            width: 130px;
+                                            height: 34px;
+                                            background: transparent;
+
+                                            FlatButton {
+                                                text: "Clear Selected";
+                                                dark-mode: root.dark-mode;
+                                                clickable: !root.running && root.trusted-fingerprint-selection != "No trusted fingerprints";
+                                                clicked => {
+                                                    root.clear-selected-fingerprint(root.trusted-fingerprint-selection);
+                                                }
+                                            }
+                                        }
+
+                                        Rectangle {
+                                            width: 110px;
+                                            height: 34px;
+                                            background: transparent;
+
+                                            FlatButton {
+                                                text: "Clear All";
+                                                dark-mode: root.dark-mode;
+                                                clickable: !root.running && root.trusted-fingerprint-selection != "No trusted fingerprints";
+                                                clicked => {
+                                                    root.clear-all-fingerprints();
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle { background: transparent; }
+                                }
+
+                                VerticalBox {
+                                    spacing: 2px;
+
+                                    Text {
+                                        text: "Trusted fingerprints";
+                                        color: root.text-tertiary;
+                                        font-size: 12px;
+                                    }
+
+                                    Rectangle {
+                                        border-color: root.border;
+                                        border-width: 1px;
+                                        border-radius: 12px;
+                                        background: root.dark-mode ? #181b18 : #fbfaf7;
+                                        height: root.trusted-fingerprint-selection == "No trusted fingerprints"
+                                            && root.trusted-fingerprint-options.length == 1 ? 54px : 92px;
+
+                                        ScrollView {
+                                            x: 8px;
+                                            y: 8px;
+                                            width: parent.width - 16px;
+                                            height: parent.height - 16px;
+                                            viewport-width: self.visible-width;
+                                            viewport-height: root.trusted-fingerprint-options.length * 34px;
+
+                                            VerticalBox {
+                                                spacing: 2px;
+
+                                                for option[index] in root.trusted-fingerprint-options : Rectangle {
+                                                    height: 32px;
+                                                    border-radius: 8px;
+                                                    background: option == root.trusted-fingerprint-selection
+                                                        ? (root.dark-mode ? #232923 : #eef3ec)
+                                                        : (fingerprint-touch.has-hover ? (root.dark-mode ? #242424 : #f3f0ea) : transparent);
+
+                                                    Text {
+                                                        x: 10px;
+                                                        y: (parent.height - self.height) / 2;
+                                                        width: parent.width - 20px;
+                                                        text: option;
+                                                        color: root.dark-mode ? #f2f2f2 : #171717;
+                                                        font-size: 11px;
+                                                        font-family: "Cascadia Mono";
+                                                        wrap: word-wrap;
+                                                    }
+
+                                                    fingerprint-touch := TouchArea {
+                                                        clicked => {
+                                                            root.trusted-fingerprint-selection = option;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
