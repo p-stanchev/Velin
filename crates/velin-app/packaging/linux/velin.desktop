@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Velin
+Comment=LAN audio routing beta for Windows and Linux
+Exec=velin-app
+Icon=velin
+Terminal=false
+Categories=AudioVideo;Audio;Network;
+StartupNotify=true

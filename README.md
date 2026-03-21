@@ -238,6 +238,7 @@ cargo install cargo-deb
 ```
 
 Both scripts write installer output into `dist/`.
+The Debian package also installs a desktop launcher and application icon for menu integration.
 
 ### Windows Firewall
 

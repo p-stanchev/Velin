@@ -35,4 +35,6 @@ priority = "optional"
 assets = [
     ["../../README.md", "usr/share/doc/velin-app/README.md", "644"],
     ["../../LICENSE", "usr/share/doc/velin-app/LICENSE", "644"],
+    ["../../assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/velin.svg", "644"],
+    ["packaging/linux/velin.desktop", "usr/share/applications/velin.desktop", "644"],
 ]
