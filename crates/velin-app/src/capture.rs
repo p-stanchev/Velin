@@ -73,6 +73,11 @@ pub fn start_audio_capture(
 }
 
 pub fn input_device_names() -> Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        return platform::microphone_source_names();
+    }
+
     let host = cpal::default_host();
     let mut names = host
         .input_devices()?
@@ -84,6 +89,11 @@ pub fn input_device_names() -> Result<Vec<String>> {
 }
 
 pub fn default_input_device_name() -> Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(platform::default_microphone_source_name());
+    }
+
     let host = cpal::default_host();
     let Some(device) = host.default_input_device() else {
         return Ok(None);
@@ -423,7 +433,7 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source(selected_source);
-        let sample_rate_hz = detect_monitor_sample_rate(monitor_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
+        let sample_rate_hz = SAMPLE_RATE_HZ;
         let mut last_error = None;
 
         for candidate in launch_candidates(&monitor_source, sample_rate_hz) {
@@ -499,11 +509,38 @@ mod platform {
         detect_monitor_source("")
     }
 
+    pub fn microphone_source_names() -> Result<Vec<String>> {
+        let output = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .context("failed to enumerate PulseAudio microphone sources")?;
+        if !output.status.success() {
+            return Err(anyhow!("pactl list short sources exited with {}", output.status));
+        }
+
+        let mut sources = vec!["System Default".to_string()];
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(name) = line.split_whitespace().nth(1) {
+                if name.ends_with(".monitor") {
+                    continue;
+                }
+                if !sources.iter().any(|existing| existing == name) {
+                    sources.push(name.to_string());
+                }
+            }
+        }
+        Ok(sources)
+    }
+
+    pub fn default_microphone_source_name() -> Option<String> {
+        detect_microphone_source("")
+    }
+
     pub fn start_microphone_capture(
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
         let microphone_source = detect_microphone_source(selected_source);
-        let sample_rate_hz = detect_monitor_sample_rate(microphone_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
+        let sample_rate_hz = SAMPLE_RATE_HZ;
         let mut last_error = None;
 
         for candidate in microphone_launch_candidates(&microphone_source, sample_rate_hz) {
