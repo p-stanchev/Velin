@@ -173,6 +173,7 @@ pub async fn run_target(
                 let pairing_prompt = pairing_prompt.clone();
                 let local_public_key = local_public_key.clone();
                 let status = Arc::clone(&status);
+                let stop_rx = accept_stop_rx.clone();
                 tokio::spawn(async move {
                     let status_tx = event_tx.clone();
                     if let Err(error) = accept_receiver_stream(
@@ -183,6 +184,7 @@ pub async fn run_target(
                         status,
                         event_tx,
                         config.audio_port,
+                        stop_rx,
                     )
                     .await
                     {
@@ -866,6 +868,7 @@ async fn accept_receiver_stream(
     status: StatusSink,
     event_tx: mpsc::UnboundedSender<ReceiverControlEvent>,
     audio_port: u16,
+    mut stop_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut security =
         SecurityStore::load_or_create().context("failed to load local pairing identity")?;
@@ -929,11 +932,17 @@ async fn accept_receiver_stream(
     tokio::spawn(async move {
         let _control_write = control_write;
         loop {
-            match poll_control_channel(&mut control_read).await {
-                Ok(ControlChannelState::Alive) => time::sleep(Duration::from_millis(50)).await,
-                Ok(ControlChannelState::Closed) | Err(_) => {
+            tokio::select! {
+                _ = wait_for_stop(&mut stop_rx) => {
                     let _ = event_tx.send(ReceiverControlEvent::Disconnected { stream_id });
                     break;
+                }
+                result = poll_control_channel(&mut control_read) => match result {
+                    Ok(ControlChannelState::Alive) => time::sleep(Duration::from_millis(50)).await,
+                    Ok(ControlChannelState::Closed) | Err(_) => {
+                        let _ = event_tx.send(ReceiverControlEvent::Disconnected { stream_id });
+                        break;
+                    }
                 }
             }
         }
