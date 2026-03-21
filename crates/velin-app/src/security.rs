@@ -41,7 +41,6 @@ pub enum TrustOutcome {
     Trusted,
     Untrusted {
         machine_name: String,
-        fingerprint: String,
     },
 }
 
@@ -118,7 +117,6 @@ impl SecurityStore {
 
         Ok(TrustOutcome::Untrusted {
             machine_name: machine_name.to_string(),
-            fingerprint: fingerprint_from_public_key_hex(&public_key_hex)?,
         })
     }
 
@@ -153,16 +151,24 @@ impl SecurityStore {
     }
 }
 
-pub fn fingerprint_from_public_key_hex(value: &str) -> Result<String> {
-    let bytes = hex::decode(value.trim()).context("invalid hex key encoding")?;
-    let digest = Sha256::digest(bytes);
-    let short = &digest[..16];
-    Ok(short
+pub fn pairing_fingerprint(local_public_key_hex: &str, peer_public_key_hex: &str) -> Result<String> {
+    let mut parts = [
+        hex::decode(local_public_key_hex.trim()).context("invalid local public key encoding")?,
+        hex::decode(peer_public_key_hex.trim()).context("invalid peer public key encoding")?,
+    ];
+    parts.sort();
+    let combined = [parts[0].as_slice(), parts[1].as_slice()].concat();
+    let digest = Sha256::digest(combined);
+    Ok(format_fingerprint(&digest[..16]))
+}
+
+fn format_fingerprint(bytes: &[u8]) -> String {
+    bytes
         .chunks(2)
         .map(hex::encode)
         .collect::<Vec<_>>()
         .join(":")
-        .to_uppercase())
+        .to_uppercase()
 }
 
 impl LocalIdentity {

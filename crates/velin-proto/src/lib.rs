@@ -23,6 +23,17 @@ pub struct Accept {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingRequired {
+    pub target_name: String,
+    pub identity_public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingDecision {
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryAnnouncement {
     pub machine_name: String,
     pub control_port: u16,

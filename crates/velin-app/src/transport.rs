@@ -1,6 +1,6 @@
 use crate::audio::open_output_device;
 use crate::capture::start_system_audio_capture;
-use crate::security::{SecurityStore, TrustOutcome};
+use crate::security::{SecurityStore, TrustOutcome, pairing_fingerprint};
 use anyhow::{Context, Result, bail};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use tokio::time;
 use velin_proto::{
     Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
-    Hello,
+    Hello, PairingDecision, PairingRequired,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -79,6 +79,7 @@ pub async fn run_target(
     let mut security =
         SecurityStore::load_or_create().context("failed to load local pairing identity")?;
     let local_identity = security.local_identity()?;
+    let local_public_key = local_identity.public_key_hex();
     let bind_ip = normalized_bind_ip(&config.bind_ip);
     let control_addr = format!("{bind_ip}:{}", config.control_port);
     let audio_addr = format!("{bind_ip}:{}", config.audio_port);
@@ -138,10 +139,16 @@ pub async fn run_target(
 
     match security.verify_peer(&hello.source_name, &hello.identity_public_key)? {
         TrustOutcome::Trusted => {}
-        TrustOutcome::Untrusted { machine_name: peer_name, fingerprint } => {
+        TrustOutcome::Untrusted { machine_name: peer_name, .. } => {
             let Some(prompt) = pairing_prompt.as_ref() else {
                 bail!("sender {peer_name} is not trusted yet; fingerprint confirmation is required");
             };
+            let fingerprint = pairing_fingerprint(&local_public_key, &hello.identity_public_key)?;
+            let pairing_required = PairingRequired {
+                target_name: host_name(),
+                identity_public_key: local_public_key.clone(),
+            };
+            write_json_message(&mut stream, &pairing_required).await?;
             let approved = prompt(PairingRequest {
                 peer_name: peer_name.clone(),
                 fingerprint: fingerprint.clone(),
@@ -149,6 +156,10 @@ pub async fn run_target(
             })?;
             if !approved {
                 bail!("pairing rejected for sender {peer_name}");
+            }
+            let decision: PairingDecision = read_json_message(&mut stream).await?;
+            if !decision.approved {
+                bail!("sender {peer_name} rejected the fingerprint confirmation");
             }
             security.trust_peer(&peer_name, &hello.identity_public_key)?;
             status(format!("Trusted sender {peer_name} with fingerprint {fingerprint}."));
@@ -174,7 +185,7 @@ pub async fn run_target(
     let accept = Accept {
         target_name: host_name(),
         audio_port: config.audio_port,
-        identity_public_key: local_identity.public_key_hex(),
+        identity_public_key: local_public_key,
     };
     write_json_message(&mut stream, &accept).await?;
 
@@ -431,6 +442,7 @@ pub async fn run_source(
     let mut security =
         SecurityStore::load_or_create().context("failed to load local pairing identity")?;
     let local_identity = security.local_identity()?;
+    let local_public_key = local_identity.public_key_hex();
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
     emit_metrics(
         &metrics,
@@ -464,32 +476,55 @@ pub async fn run_source(
         source_name: host_name(),
         sample_rate_hz: capture.sample_rate_hz(),
         channels: CHANNELS,
-        identity_public_key: local_identity.public_key_hex(),
+        identity_public_key: local_public_key.clone(),
     };
     write_json_message(&mut stream, &hello).await?;
 
-    let accept: Accept = tokio::select! {
-        result = read_json_message(&mut stream) => result,
+    let accept = match tokio::select! {
+        result = read_source_response(&mut stream) => result,
         _ = wait_for_stop(&mut stop_rx) => return Ok(()),
-    }?;
-    match security.verify_peer(&accept.target_name, &accept.identity_public_key)? {
-        TrustOutcome::Trusted => {}
-        TrustOutcome::Untrusted { machine_name: peer_name, fingerprint } => {
+    }? {
+        SourceResponse::Accept(accept) => {
+            verify_or_prompt_pairing(
+                &mut security,
+                pairing_prompt.as_ref(),
+                "receiver",
+                &local_public_key,
+                &accept.target_name,
+                &accept.identity_public_key,
+            )?;
+            accept
+        }
+        SourceResponse::PairingRequired(required) => {
+            let fingerprint = pairing_fingerprint(&local_public_key, &required.identity_public_key)?;
             let Some(prompt) = pairing_prompt.as_ref() else {
-                bail!("receiver {peer_name} is not trusted yet; fingerprint confirmation is required");
+                bail!(
+                    "receiver {} is not trusted yet; fingerprint confirmation is required",
+                    required.target_name
+                );
             };
             let approved = prompt(PairingRequest {
-                peer_name: peer_name.clone(),
+                peer_name: required.target_name.clone(),
                 fingerprint: fingerprint.clone(),
                 role: "receiver".to_string(),
             })?;
+            write_json_message(&mut stream, &PairingDecision { approved }).await?;
             if !approved {
-                bail!("pairing rejected for receiver {peer_name}");
+                bail!("pairing rejected for receiver {}", required.target_name);
             }
-            security.trust_peer(&peer_name, &accept.identity_public_key)?;
-            status(format!("Trusted receiver {peer_name} with fingerprint {fingerprint}."));
+            let accept: Accept = tokio::select! {
+                result = read_json_message(&mut stream) => result,
+                _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+            }?;
+            security.trust_peer(&accept.target_name, &accept.identity_public_key)?;
+            status(format!(
+                "Trusted receiver {} with fingerprint {}.",
+                accept.target_name,
+                fingerprint
+            ));
+            accept
         }
-    }
+    };
     let session_cipher = SessionCipher::new(
         local_identity
             .derive_session_key(&accept.identity_public_key)
@@ -844,6 +879,11 @@ enum ControlChannelState {
     Closed,
 }
 
+enum SourceResponse {
+    Accept(Accept),
+    PairingRequired(PairingRequired),
+}
+
 async fn poll_control_channel(stream: &mut OwnedReadHalf) -> Result<ControlChannelState> {
     match time::timeout(Duration::from_millis(5), stream.read_u8()).await {
         Ok(Ok(_)) => bail!("receiver control channel sent unexpected data"),
@@ -884,6 +924,62 @@ where
         .await
         .context("failed to read control payload")?;
     serde_json::from_slice(&body).context("failed to decode control message")
+}
+
+async fn read_source_response(stream: &mut TcpStream) -> Result<SourceResponse> {
+    let len = stream
+        .read_u32_le()
+        .await
+        .context("failed to read control length")?;
+    let mut body = vec![0_u8; len as usize];
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("failed to read control payload")?;
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).context("failed to decode control message")?;
+    if value.get("audio_port").is_some() {
+        return serde_json::from_value(value)
+            .map(SourceResponse::Accept)
+            .context("failed to decode accept message");
+    }
+    if value.get("identity_public_key").is_some() && value.get("target_name").is_some() {
+        return serde_json::from_value(value)
+            .map(SourceResponse::PairingRequired)
+            .context("failed to decode pairing prompt");
+    }
+
+    bail!("unexpected control message during source handshake")
+}
+
+fn verify_or_prompt_pairing(
+    security: &mut SecurityStore,
+    pairing_prompt: Option<&PairingPrompt>,
+    role: &str,
+    local_public_key: &str,
+    peer_name: &str,
+    peer_public_key: &str,
+) -> Result<()> {
+    match security.verify_peer(peer_name, peer_public_key)? {
+        TrustOutcome::Trusted => Ok(()),
+        TrustOutcome::Untrusted { machine_name, .. } => {
+            let Some(prompt) = pairing_prompt else {
+                bail!("{role} {machine_name} is not trusted yet; fingerprint confirmation is required");
+            };
+            let fingerprint = pairing_fingerprint(local_public_key, peer_public_key)?;
+            let approved = prompt(PairingRequest {
+                peer_name: machine_name.clone(),
+                fingerprint: fingerprint.clone(),
+                role: role.to_string(),
+            })?;
+            if !approved {
+                bail!("pairing rejected for {role} {machine_name}");
+            }
+            security.trust_peer(&machine_name, peer_public_key)?;
+            Ok(())
+        }
+    }
 }
 
 fn host_name() -> String {

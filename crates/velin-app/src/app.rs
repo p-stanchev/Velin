@@ -50,8 +50,15 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
         .context("failed to load settings")?;
     let config = settings.session_config();
     let status = cli_status_sink();
-    let (_stop_tx, stop_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let (_mute_tx, mute_rx) = watch::channel(false);
+    let ctrl_c_status = Arc::clone(&status);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = stop_tx.send(true);
+            ctrl_c_status("Ctrl+C received. Stopping session...".to_string());
+        }
+    });
 
     match mode {
         "target" | "listen" => run_target(config, status, None, None, stop_rx, mute_rx).await,
@@ -384,6 +391,16 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
                 CloseRequestResponse::KeepWindowShown
             } else {
                 CloseRequestResponse::HideWindow
+            }
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let session_state = Arc::clone(&session_state);
+        runtime.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                request_stop(&weak, &session_state, true);
             }
         });
     }
