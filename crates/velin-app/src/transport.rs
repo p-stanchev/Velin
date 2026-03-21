@@ -160,7 +160,7 @@ pub async fn run_target(
                     &frame.samples,
                     hello.sample_rate_hz,
                     player.sample_rate_hz(),
-                    player.channel_count(),
+                    CHANNELS as usize,
                 );
                 buffered_frames.entry(frame.sequence).or_insert(resampled);
 

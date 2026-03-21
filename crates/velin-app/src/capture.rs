@@ -45,7 +45,7 @@ mod platform {
     use std::thread;
     use std::time::Duration;
     use tokio::sync::mpsc;
-    use velin_proto::{CHANNELS, FRAME_SAMPLES, SAMPLE_RATE_HZ};
+    use velin_proto::{CHANNELS, SAMPLE_RATE_HZ};
 
     pub struct LinuxSystemCapture {
         child: Child,
@@ -63,9 +63,10 @@ mod platform {
 
     pub fn start_capture() -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source();
+        let sample_rate_hz = detect_monitor_sample_rate(monitor_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
         let mut last_error = None;
 
-        for candidate in launch_candidates(&monitor_source) {
+        for candidate in launch_candidates(&monitor_source, sample_rate_hz) {
             match spawn_capture_process(&candidate) {
                 Ok(mut child) => {
                     let stdout = child
@@ -77,7 +78,8 @@ mod platform {
                         .name("velin-linux-capture".to_string())
                         .spawn(move || {
                             let mut stdout = stdout;
-                            let mut bytes = vec![0_u8; FRAME_SAMPLES * CHANNELS as usize * 2];
+                            let mut bytes =
+                                vec![0_u8; samples_per_10ms(sample_rate_hz) * CHANNELS as usize * 2];
                             loop {
                                 if stdout.read_exact(&mut bytes).is_err() {
                                     break;
@@ -96,7 +98,7 @@ mod platform {
                         .context("failed to spawn Linux capture thread")?;
 
                     return Ok((
-                        SAMPLE_RATE_HZ,
+                        sample_rate_hz,
                         receiver,
                         LinuxSystemCapture {
                             child,
@@ -120,7 +122,7 @@ mod platform {
         description: String,
     }
 
-    fn launch_candidates(monitor_source: &Option<String>) -> Vec<CaptureCommand> {
+    fn launch_candidates(monitor_source: &Option<String>, sample_rate_hz: u32) -> Vec<CaptureCommand> {
         let mut candidates = Vec::new();
         let mut sources = Vec::new();
 
@@ -138,11 +140,8 @@ mod platform {
                     format!("--device={source}"),
                     "--raw".to_string(),
                     "--format=s16le".to_string(),
-                    "--fix-format".to_string(),
-                    "--rate=48000".to_string(),
-                    "--fix-rate".to_string(),
+                    format!("--rate={sample_rate_hz}"),
                     "--channels=2".to_string(),
-                    "--fix-channels".to_string(),
                 ],
                 description: format!("parec monitor source {source}"),
             });
@@ -201,6 +200,55 @@ mod platform {
         }
 
         None
+    }
+
+    fn detect_monitor_sample_rate(selected_source: Option<&str>) -> Option<u32> {
+        let output = Command::new("pactl").args(["list", "sources"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let selected_source = selected_source
+            .filter(|source| *source != "@DEFAULT_MONITOR@")
+            .map(str::trim);
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let mut current_name: Option<String> = None;
+
+        for line in listing.lines() {
+            let trimmed = line.trim();
+
+            if let Some(name) = trimmed.strip_prefix("Name:") {
+                current_name = Some(name.trim().to_string());
+                continue;
+            }
+
+            if let Some(spec) = trimmed.strip_prefix("Sample Specification:") {
+                let matches_selected = selected_source
+                    .map(|source| current_name.as_deref() == Some(source))
+                    .unwrap_or_else(|| {
+                        current_name
+                            .as_deref()
+                            .is_some_and(|name| name.ends_with(".monitor"))
+                    });
+
+                if matches_selected {
+                    return parse_sample_rate_from_spec(spec);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn parse_sample_rate_from_spec(spec: &str) -> Option<u32> {
+        spec.split_whitespace().find_map(|token| {
+            let hz = token.strip_suffix("Hz")?;
+            hz.parse::<u32>().ok()
+        })
+    }
+
+    fn samples_per_10ms(sample_rate_hz: u32) -> usize {
+        ((sample_rate_hz as u64 * 10) / 1000) as usize
     }
 }
 
