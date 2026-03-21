@@ -439,7 +439,7 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source(selected_source);
-        let sample_rate_hz = detect_source_sample_rate(monitor_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
+        let sample_rate_hz = SAMPLE_RATE_HZ;
         let mut last_error = None;
 
         for candidate in launch_candidates(&monitor_source, sample_rate_hz) {
@@ -546,7 +546,7 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
         let microphone_source = detect_microphone_source(selected_source);
-        let sample_rate_hz = detect_source_sample_rate(microphone_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
+        let sample_rate_hz = SAMPLE_RATE_HZ;
         let mut last_error = None;
 
         for candidate in microphone_launch_candidates(&microphone_source, sample_rate_hz) {
@@ -760,47 +760,6 @@ mod platform {
         }
 
         None
-    }
-
-    fn detect_source_sample_rate(selected_source: Option<&str>) -> Option<u32> {
-        let output = Command::new("pactl").args(["list", "sources"]).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        let selected_source = selected_source
-            .filter(|source| !source.is_empty() && *source != "@DEFAULT_MONITOR@" && *source != "@DEFAULT_SOURCE@")
-            .map(str::trim);
-        let listing = String::from_utf8_lossy(&output.stdout);
-        let mut current_name: Option<String> = None;
-
-        for line in listing.lines() {
-            let trimmed = line.trim();
-
-            if let Some(name) = trimmed.strip_prefix("Name:") {
-                current_name = Some(name.trim().to_string());
-                continue;
-            }
-
-            if let Some(spec) = trimmed.strip_prefix("Sample Specification:") {
-                let matches_selected = selected_source
-                    .map(|source| current_name.as_deref() == Some(source))
-                    .unwrap_or(false);
-
-                if matches_selected {
-                    return parse_sample_rate_from_spec(spec);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn parse_sample_rate_from_spec(spec: &str) -> Option<u32> {
-        spec.split_whitespace().find_map(|token| {
-            let hz = token.strip_suffix("Hz")?;
-            hz.parse::<u32>().ok()
-        })
     }
 
     fn samples_per_10ms(sample_rate_hz: u32) -> usize {
