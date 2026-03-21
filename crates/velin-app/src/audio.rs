@@ -5,11 +5,19 @@ use cpal::{I24, Sample, SampleFormat, SizedSample, Stream, StreamConfig, Support
 use cpal::{BufferSize, SupportedBufferSize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
+use std::thread;
 use velin_proto::{CHANNELS, SAMPLE_RATE_HZ};
 
 const MAX_BUFFERED_SAMPLES: usize = SAMPLE_RATE_HZ as usize * CHANNELS as usize * 2;
+#[cfg(target_os = "linux")]
+const LINUX_OUTPUT_CHUNK_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 100 * CHANNELS as usize;
 
 #[derive(Default)]
 struct PlaybackBuffer {
@@ -17,12 +25,35 @@ struct PlaybackBuffer {
 }
 
 pub struct OutputPlayer {
-    _stream: Stream,
+    _backend: OutputBackend,
     buffer: Arc<Mutex<PlaybackBuffer>>,
     muted: Arc<AtomicBool>,
     backend_error: Arc<AtomicBool>,
     config_summary: String,
     sample_rate_hz: u32,
+}
+
+enum OutputBackend {
+    Cpal { _stream: Stream },
+    #[cfg(target_os = "linux")]
+    LinuxPipe(LinuxPipeBackend),
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPipeBackend {
+    child: Child,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxPipeBackend {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl OutputPlayer {
@@ -86,6 +117,13 @@ pub fn default_output_device_name() -> Result<Option<String>> {
 }
 
 pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)> {
+    #[cfg(target_os = "linux")]
+    if selected_name.trim().is_empty() {
+        if let Ok(player) = open_linux_pipe_output_device() {
+            return Ok((player, "System Default".to_string()));
+        }
+    }
+
     let host = cpal::default_host();
     let device = select_output_device(&host, selected_name)?;
     let device_name = if selected_name.trim().is_empty() {
@@ -152,7 +190,7 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
 
     Ok((
         OutputPlayer {
-            _stream: stream,
+            _backend: OutputBackend::Cpal { _stream: stream },
             buffer,
             muted,
             backend_error,
@@ -161,6 +199,69 @@ pub fn open_output_device(selected_name: &str) -> Result<(OutputPlayer, String)>
         },
         device_name,
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_pipe_output_device() -> Result<OutputPlayer> {
+    let mut child = Command::new("aplay")
+        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start aplay for Linux output")?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .context("aplay did not provide a stdin pipe")?;
+    let buffer = Arc::new(Mutex::new(PlaybackBuffer::default()));
+    let muted = Arc::new(AtomicBool::new(false));
+    let backend_error = Arc::new(AtomicBool::new(false));
+    let thread_buffer = Arc::clone(&buffer);
+    let thread_muted = Arc::clone(&muted);
+    let thread_backend_error = Arc::clone(&backend_error);
+    let thread = thread::Builder::new()
+        .name("velin-linux-output".to_string())
+        .spawn(move || {
+            let mut stdin = stdin;
+            let mut bytes = vec![0_u8; LINUX_OUTPUT_CHUNK_SAMPLES * 2];
+
+            loop {
+                let mut frame = vec![0_f32; LINUX_OUTPUT_CHUNK_SAMPLES];
+                if !thread_muted.load(Ordering::Relaxed) {
+                    let mut playback = thread_buffer.lock().expect("playback buffer poisoned");
+                    for sample in &mut frame {
+                        *sample = playback.samples.pop_front().unwrap_or(0.0);
+                    }
+                }
+
+                for (index, sample) in frame.iter().enumerate() {
+                    let pcm = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+                    let encoded = pcm.to_le_bytes();
+                    bytes[index * 2] = encoded[0];
+                    bytes[index * 2 + 1] = encoded[1];
+                }
+
+                if stdin.write_all(&bytes).is_err() {
+                    thread_backend_error.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        })
+        .context("failed to spawn Linux output writer thread")?;
+
+    Ok(OutputPlayer {
+        _backend: OutputBackend::LinuxPipe(LinuxPipeBackend {
+            child,
+            thread: Some(thread),
+        }),
+        buffer,
+        muted,
+        backend_error,
+        config_summary: "48000 Hz, 2 ch, I16, aplay default".to_string(),
+        sample_rate_hz: SAMPLE_RATE_HZ,
+    })
 }
 
 fn select_output_device(host: &cpal::Host, selected_name: &str) -> Result<cpal::Device> {
