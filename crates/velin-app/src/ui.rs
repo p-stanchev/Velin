@@ -81,6 +81,7 @@ slint::slint! {
         in-out property <string> control-port: "49000";
         in-out property <string> audio-port: "49001";
         in-out property <string> status-text: "Idle";
+        in-out property <string> metrics-text: "No active stream.\n";
         in-out property <string> log-text: "";
         in-out property <string> local-addresses: "Local IP unavailable";
         in-out property <string> local-machine-name: "Unknown";
@@ -94,6 +95,7 @@ slint::slint! {
         in-out property <bool> discovered-peer-menu-open: false;
         in-out property <bool> muted: false;
         callback select-session-tab();
+        callback select-metrics-tab();
         callback select-settings-tab();
         callback start-target();
         callback start-source(string);
@@ -107,7 +109,7 @@ slint::slint! {
         title: "Velin";
         icon: @image-url("../../assets/logo.svg");
         width: 680px;
-        height: 620px;
+        height: 700px;
 
         in property <color> bg: root.dark-mode ? #171717 : #f4f2ed;
         in property <color> panel-bg: root.dark-mode ? #1f1f1f : #fbfaf7;
@@ -154,10 +156,28 @@ slint::slint! {
                         background: transparent;
 
                         FlatButton {
-                            text: "Settings";
+                            text: "Metrics";
                             dark-mode: root.dark-mode;
                             active: root.active-tab == 1;
                             clickable: root.active-tab != 1;
+                            clicked => {
+                                root.bind-ip-menu-open = false;
+                                root.output-device-menu-open = false;
+                                root.discovered-peer-menu-open = false;
+                                root.select-metrics-tab();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 120px;
+                        background: transparent;
+
+                        FlatButton {
+                            text: "Settings";
+                            dark-mode: root.dark-mode;
+                            active: root.active-tab == 2;
+                            clickable: root.active-tab != 2;
                             clicked => {
                                 root.bind-ip-menu-open = false;
                                 root.output-device-menu-open = false;
@@ -515,6 +535,58 @@ slint::slint! {
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
+                    height: 432px;
+
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "Metrics";
+                            color: root.text-primary;
+                            font-size: 16px;
+                            font-weight: 600;
+                        }
+
+                        Text {
+                            text: "Live stream health, queue depth, and reconnect state.";
+                            color: root.text-secondary;
+                            font-size: 12px;
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+                            height: 340px;
+
+                            ScrollView {
+                                x: 10px;
+                                y: 10px;
+                                width: parent.width - 20px;
+                                height: parent.height - 20px;
+                                viewport-width: self.visible-width;
+                                viewport-height: max(self.visible-height, metrics-body.preferred-height + 8px);
+
+                                metrics-body := Text {
+                                    width: parent.visible-width - 8px;
+                                    text: root.metrics-text;
+                                    color: root.text-primary;
+                                    font-size: 13px;
+                                    font-family: "Cascadia Mono";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.active-tab == 2 : Rectangle {
+                    border-color: root.border;
+                    border-width: 1px;
+                    border-radius: 14px;
+                    background: root.panel-bg;
                     height: 344px;
 
                     VerticalBox {
@@ -822,35 +894,46 @@ slint::slint! {
                     }
                 }
 
-                if root.active-tab == 0 : Text {
-                    text: "Log";
-                    color: root.text-primary;
-                    font-size: 14px;
-                    font-weight: 600;
-                }
-
                 if root.active-tab == 0 : Rectangle {
                     border-color: root.border;
                     border-width: 1px;
                     border-radius: 14px;
                     background: root.panel-bg;
-                    height: 76px;
 
-                    ScrollView {
-                        x: 10px;
-                        y: 10px;
-                        width: parent.width - 20px;
-                        height: parent.height - 20px;
-                        viewport-width: self.visible-width;
-                        viewport-height: max(self.visible-height, log-body.preferred-height + 8px);
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 8px;
 
-                        log-body := Text {
-                            width: parent.visible-width - 8px;
-                            text: root.log-text;
+                        Text {
+                            text: "Log";
                             color: root.text-primary;
-                            font-size: 12px;
-                            font-family: "Cascadia Mono";
-                            wrap: word-wrap;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+
+                        Rectangle {
+                            border-color: root.border;
+                            border-width: 1px;
+                            border-radius: 12px;
+                            background: root.panel-alt;
+
+                            ScrollView {
+                                x: 10px;
+                                y: 10px;
+                                width: parent.width - 20px;
+                                height: parent.height - 20px;
+                                viewport-width: self.visible-width;
+                                viewport-height: max(self.visible-height, log-body.preferred-height + 8px);
+
+                                log-body := Text {
+                                    width: parent.visible-width - 8px;
+                                    text: root.log-text;
+                                    color: root.text-primary;
+                                    font-size: 12px;
+                                    font-family: "Cascadia Mono";
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
                     }
                 }

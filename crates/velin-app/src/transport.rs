@@ -18,6 +18,7 @@ use velin_proto::{
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
+pub type MetricsSink = Arc<dyn Fn(String) + Send + Sync>;
 const JITTER_BUFFER_MIN_TARGET_FRAMES: usize = 6;
 const JITTER_BUFFER_DEFAULT_TARGET_FRAMES: usize = 12;
 const JITTER_BUFFER_MAX_FRAMES: usize = 160;
@@ -36,6 +37,7 @@ pub struct SessionConfig {
 pub async fn run_target(
     config: SessionConfig,
     status: StatusSink,
+    metrics: Option<MetricsSink>,
     mut stop_rx: watch::Receiver<bool>,
     mut mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -81,6 +83,14 @@ pub async fn run_target(
     });
     status(format!("Playback device: {device_name}."));
     status(format!("Playback config: {}.", player.config_summary()));
+    emit_metrics(
+        &metrics,
+        format!(
+            "Mode: Receiver\nState: Listening\nBind: {bind_ip}:{}\nPlayback device: {device_name}\nPlayback config: {}",
+            config.control_port,
+            player.config_summary()
+        ),
+    );
 
     let (mut stream, peer_addr) = tokio::select! {
         result = listener.accept() => result.context("failed to accept source")?,
@@ -89,6 +99,15 @@ pub async fn run_target(
     let hello: Hello = read_json_message(&mut stream).await?;
 
     status(format!("Sender {} connected from {peer_addr}.", hello.source_name));
+    emit_metrics(
+        &metrics,
+        format!(
+            "Mode: Receiver\nState: Connected\nSender: {}\nSender sample rate: {} Hz\nPlayback device: {device_name}\nPlayback config: {}",
+            hello.source_name,
+            hello.sample_rate_hz,
+            player.config_summary()
+        ),
+    );
 
     let accept = Accept {
         target_name: host_name(),
@@ -275,6 +294,21 @@ pub async fn run_target(
                         buffered_frames.len(),
                         player.buffered_sample_count() / output_frame_samples
                     ));
+                    emit_metrics(
+                        &metrics,
+                        format!(
+                            "Mode: Receiver\nState: Streaming\nSender: {}\nSource: {} Hz -> Playback: {} Hz\nFrames: received {received_frames}, played {played_frames}\nLatency estimate: {} ms\nNetwork buffer: {} frames\nAudio queue: {} frames\nJitter target: {} frames\nLoss: missing {missing_packets}, late {late_packets}, reordered {reordered_packets}, dropped {dropped_frames}, underruns {underrun_frames}\nAverage network buffer: {:.1} frames\nUptime: {:.1}s",
+                            hello.source_name,
+                            hello.sample_rate_hz,
+                            player.sample_rate_hz(),
+                            ((buffered_frames.len() + (player.buffered_sample_count() / output_frame_samples)) * 10),
+                            buffered_frames.len(),
+                            player.buffered_sample_count() / output_frame_samples,
+                            jitter_target_frames,
+                            average_depth,
+                            seconds
+                        ),
+                    );
                 }
             }
             result = mute_rx.changed() => {
@@ -290,10 +324,17 @@ pub async fn run_target(
 pub async fn run_source(
     config: SessionConfig,
     status: StatusSink,
+    metrics: Option<MetricsSink>,
     mut stop_rx: watch::Receiver<bool>,
     mute_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let control_addr = format!("{}:{}", config.target_ip, config.control_port);
+    emit_metrics(
+        &metrics,
+        format!(
+            "Mode: Sender\nState: Connecting\nTarget: {control_addr}\nReconnect: waiting for receiver"
+        ),
+    );
     let mut stream = tokio::select! {
         result = time::timeout(Duration::from_secs(3), TcpStream::connect(&control_addr)) => {
             result
@@ -308,6 +349,13 @@ pub async fn run_source(
         "Capturing system audio at {} Hz.",
         capture.sample_rate_hz()
     ));
+    emit_metrics(
+        &metrics,
+        format!(
+            "Mode: Sender\nState: Connected control channel\nTarget: {control_addr}\nCapture rate: {} Hz",
+            capture.sample_rate_hz()
+        ),
+    );
 
     let hello = Hello {
         source_name: host_name(),
@@ -390,6 +438,22 @@ pub async fn run_source(
 
             if sequence == 0 || sequence % 100 == 0 {
                 status(format!("Sent frame {sequence}."));
+                let seconds = send_start.elapsed().as_secs_f32();
+                let pending_frame_count = pending_samples.len() / frame_sample_count.max(1);
+                let pending_latency_ms =
+                    ((pending_samples.len() as f32 / CHANNELS as usize as f32) / capture.sample_rate_hz() as f32 * 1000.0)
+                        .round() as u32;
+                emit_metrics(
+                    &metrics,
+                    format!(
+                        "Mode: Sender\nState: Streaming\nReceiver: {}\nCapture rate: {} Hz\nFrames sent: {sequence}\nPending capture queue: {} frames\nPending capture latency: {} ms\nUptime: {:.1}s",
+                        accept.target_name,
+                        capture.sample_rate_hz(),
+                        pending_frame_count,
+                        pending_latency_ms,
+                        seconds
+                    ),
+                );
             }
 
             sequence += 1;
@@ -398,6 +462,62 @@ pub async fn run_source(
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+pub async fn run_source_with_reconnect(
+    config: SessionConfig,
+    status: StatusSink,
+    metrics: Option<MetricsSink>,
+    mut stop_rx: watch::Receiver<bool>,
+    mute_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+    let mut delay_seconds = 2_u64;
+
+    loop {
+        let result = run_source(
+            config.clone(),
+            Arc::clone(&status),
+            metrics.clone(),
+            stop_rx.clone(),
+            mute_rx.clone(),
+        )
+        .await;
+
+        if *stop_rx.borrow() {
+            return Ok(());
+        }
+
+        attempt += 1;
+        let reconnect_message = format!(
+            "Mode: Sender\nState: Reconnecting\nTarget: {}:{}\nNext attempt: {} in {}s",
+            config.target_ip,
+            config.control_port,
+            attempt,
+            delay_seconds
+        );
+        emit_metrics(&metrics, reconnect_message);
+
+        match result {
+            Ok(()) => status(format!(
+                "Receiver disconnected. Reconnecting in {}s (attempt {}).",
+                delay_seconds, attempt
+            )),
+            Err(error) => status(format!(
+                "Sender session interrupted. Reconnecting in {}s (attempt {}). {}",
+                delay_seconds,
+                attempt,
+                describe_short_error(&error)
+            )),
+        }
+
+        tokio::select! {
+            _ = time::sleep(Duration::from_secs(delay_seconds)) => {}
+            _ = wait_for_stop(&mut stop_rx) => return Ok(()),
+        }
+
+        delay_seconds = (delay_seconds + 1).min(5);
+    }
 }
 
 async fn run_discovery_broadcaster(
@@ -440,6 +560,17 @@ fn frame_duration_for(sequence: u64, sample_rate_hz: u32) -> Duration {
     let samples_per_channel = samples_per_10ms(sample_rate_hz) as f64;
     let seconds = (sequence as f64 * samples_per_channel) / sample_rate_hz as f64;
     Duration::from_secs_f64(seconds)
+}
+
+fn emit_metrics(metrics: &Option<MetricsSink>, message: String) {
+    if let Some(sink) = metrics {
+        sink(message);
+    }
+}
+
+fn describe_short_error(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    text.lines().next().unwrap_or("unknown error").to_string()
 }
 
 fn samples_per_10ms(sample_rate_hz: u32) -> usize {

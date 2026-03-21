@@ -156,9 +156,9 @@ velin/
 
 - [x] Capture full system audio on Windows
 - [x] Capture full system audio on Linux
-- [ ] Improve stream health and latency reporting
-- [ ] Remember preferred peers and devices
-- [ ] Auto-reconnect
+- [x] Improve stream health and latency reporting
+- [x] Remember preferred peers and devices
+- [x] Auto-reconnect
 
 ### Phase 3: Advanced Routing
 

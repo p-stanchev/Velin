@@ -14,6 +14,12 @@ pub enum ThemeMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreferredPeer {
+    pub label: String,
+    pub ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub target_ip: String,
@@ -22,6 +28,7 @@ pub struct AppSettings {
     pub control_port: u16,
     pub audio_port: u16,
     pub theme_mode: ThemeMode,
+    pub preferred_peers: Vec<PreferredPeer>,
 }
 
 impl Default for AppSettings {
@@ -33,6 +40,7 @@ impl Default for AppSettings {
             control_port: DEFAULT_CONTROL_PORT,
             audio_port: DEFAULT_AUDIO_PORT,
             theme_mode: ThemeMode::Dark,
+            preferred_peers: Vec::new(),
         }
     }
 }
