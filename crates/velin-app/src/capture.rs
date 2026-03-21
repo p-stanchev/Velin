@@ -439,7 +439,8 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source(selected_source);
-        let sample_rate_hz = SAMPLE_RATE_HZ;
+        let native_rate_hz = detect_source_sample_rate(monitor_source.as_deref());
+        let sample_rate_hz = native_rate_hz.unwrap_or(SAMPLE_RATE_HZ);
         eprintln!(
             "linux system capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
             monitor_source,
@@ -447,20 +448,21 @@ mod platform {
         );
         let mut last_error = None;
 
-        for candidate in launch_candidates(&monitor_source, sample_rate_hz) {
+        for candidate in launch_candidates(&monitor_source, native_rate_hz) {
             match spawn_capture_process(&candidate) {
                 Ok(mut child) => {
                     let stdout = child
                         .stdout
                         .take()
                         .context("capture process did not provide a stdout stream")?;
+                    let candidate_rate_hz = candidate.sample_rate_hz;
                     let (sender, receiver) = mpsc::unbounded_channel();
                     let thread = thread::Builder::new()
                         .name("velin-linux-capture".to_string())
                         .spawn(move || {
                             let mut stdout = stdout;
                             let mut bytes =
-                                vec![0_u8; samples_per_10ms(sample_rate_hz) * CHANNELS as usize * 2];
+                                vec![0_u8; samples_per_10ms(candidate_rate_hz) * CHANNELS as usize * 2];
                             loop {
                                 if stdout.read_exact(&mut bytes).is_err() {
                                     break;
@@ -479,7 +481,7 @@ mod platform {
                         .context("failed to spawn Linux capture thread")?;
 
                     return Ok((
-                        sample_rate_hz,
+                        candidate_rate_hz,
                         receiver,
                         LinuxSystemCapture {
                             child,
@@ -551,7 +553,8 @@ mod platform {
         selected_source: &str,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
         let microphone_source = detect_microphone_source(selected_source);
-        let sample_rate_hz = SAMPLE_RATE_HZ;
+        let native_rate_hz = detect_source_sample_rate(microphone_source.as_deref());
+        let sample_rate_hz = native_rate_hz.unwrap_or(SAMPLE_RATE_HZ);
         eprintln!(
             "linux microphone capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
             microphone_source,
@@ -559,20 +562,21 @@ mod platform {
         );
         let mut last_error = None;
 
-        for candidate in microphone_launch_candidates(&microphone_source, sample_rate_hz) {
+        for candidate in microphone_launch_candidates(&microphone_source, native_rate_hz) {
             match spawn_capture_process(&candidate) {
                 Ok(mut child) => {
                     let stdout = child
                         .stdout
                         .take()
                         .context("microphone capture process did not provide a stdout stream")?;
+                    let candidate_rate_hz = candidate.sample_rate_hz;
                     let (sender, receiver) = mpsc::unbounded_channel();
                     let thread = thread::Builder::new()
                         .name("velin-linux-microphone".to_string())
                         .spawn(move || {
                             let mut stdout = stdout;
                             let mut bytes =
-                                vec![0_u8; samples_per_10ms(sample_rate_hz) * CHANNELS as usize * 2];
+                                vec![0_u8; samples_per_10ms(candidate_rate_hz) * CHANNELS as usize * 2];
                             loop {
                                 if stdout.read_exact(&mut bytes).is_err() {
                                     break;
@@ -591,7 +595,7 @@ mod platform {
                         .context("failed to spawn Linux microphone capture thread")?;
 
                     return Ok((
-                        sample_rate_hz,
+                        candidate_rate_hz,
                         receiver,
                         LinuxPulseCapture {
                             child,
@@ -611,9 +615,10 @@ mod platform {
         program: &'static str,
         args: Vec<String>,
         description: String,
+        sample_rate_hz: u32,
     }
 
-    fn launch_candidates(monitor_source: &Option<String>, sample_rate_hz: u32) -> Vec<CaptureCommand> {
+    fn launch_candidates(monitor_source: &Option<String>, native_rate_hz: Option<u32>) -> Vec<CaptureCommand> {
         let mut candidates = Vec::new();
         let mut sources = Vec::new();
 
@@ -625,6 +630,24 @@ mod platform {
         }
 
         for source in sources {
+            if let Some(rate_hz) = native_rate_hz {
+                candidates.push(CaptureCommand {
+                    program: "parec",
+                    args: vec![
+                        format!("--device={source}"),
+                        "--raw".to_string(),
+                        "--format=s16le".to_string(),
+                        "--fix-format".to_string(),
+                        "--fix-channels".to_string(),
+                        "--latency-msec=20".to_string(),
+                        format!("--rate={rate_hz}"),
+                        "--channels=2".to_string(),
+                    ],
+                    description: format!("parec monitor source {source} @ native {rate_hz} Hz"),
+                    sample_rate_hz: rate_hz,
+                });
+            }
+
             candidates.push(CaptureCommand {
                 program: "parec",
                 args: vec![
@@ -635,17 +658,18 @@ mod platform {
                     "--fix-rate".to_string(),
                     "--fix-channels".to_string(),
                     "--latency-msec=20".to_string(),
-                    format!("--rate={sample_rate_hz}"),
+                    format!("--rate={SAMPLE_RATE_HZ}"),
                     "--channels=2".to_string(),
                 ],
-                description: format!("parec monitor source {source}"),
+                description: format!("parec monitor source {source} @ fallback {SAMPLE_RATE_HZ} Hz"),
+                sample_rate_hz: SAMPLE_RATE_HZ,
             });
         }
 
         candidates
     }
 
-    fn microphone_launch_candidates(source: &Option<String>, sample_rate_hz: u32) -> Vec<CaptureCommand> {
+    fn microphone_launch_candidates(source: &Option<String>, native_rate_hz: Option<u32>) -> Vec<CaptureCommand> {
         let mut candidates = Vec::new();
         let mut sources = Vec::new();
 
@@ -657,6 +681,24 @@ mod platform {
         }
 
         for source in sources {
+            if let Some(rate_hz) = native_rate_hz {
+                candidates.push(CaptureCommand {
+                    program: "parec",
+                    args: vec![
+                        format!("--device={source}"),
+                        "--raw".to_string(),
+                        "--format=s16le".to_string(),
+                        "--fix-format".to_string(),
+                        "--fix-channels".to_string(),
+                        "--latency-msec=20".to_string(),
+                        format!("--rate={rate_hz}"),
+                        "--channels=2".to_string(),
+                    ],
+                    description: format!("parec microphone source {source} @ native {rate_hz} Hz"),
+                    sample_rate_hz: rate_hz,
+                });
+            }
+
             candidates.push(CaptureCommand {
                 program: "parec",
                 args: vec![
@@ -667,10 +709,11 @@ mod platform {
                     "--fix-rate".to_string(),
                     "--fix-channels".to_string(),
                     "--latency-msec=20".to_string(),
-                    format!("--rate={sample_rate_hz}"),
+                    format!("--rate={SAMPLE_RATE_HZ}"),
                     "--channels=2".to_string(),
                 ],
-                description: format!("parec microphone source {source}"),
+                description: format!("parec microphone source {source} @ fallback {SAMPLE_RATE_HZ} Hz"),
+                sample_rate_hz: SAMPLE_RATE_HZ,
             });
         }
 
@@ -775,6 +818,47 @@ mod platform {
             }
         }
 
+        None
+    }
+
+    fn detect_source_sample_rate(selected_source: Option<&str>) -> Option<u32> {
+        let source_name = selected_source?.trim();
+        if source_name.is_empty() {
+            return None;
+        }
+
+        let output = Command::new("pactl").args(["list", "sources"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_name: Option<&str> = None;
+
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(name) = trimmed.strip_prefix("Name:") {
+                current_name = Some(name.trim());
+                continue;
+            }
+
+            if current_name == Some(source_name) {
+                if let Some(spec) = trimmed.strip_prefix("Sample Specification:") {
+                    return parse_sample_rate_from_spec(spec.trim());
+                }
+            }
+        }
+
+        None
+    }
+
+    fn parse_sample_rate_from_spec(spec: &str) -> Option<u32> {
+        for token in spec.split_whitespace() {
+            let rate = token.strip_suffix("Hz")?;
+            if let Ok(parsed) = rate.parse::<u32>() {
+                return Some(parsed);
+            }
+        }
         None
     }
 
