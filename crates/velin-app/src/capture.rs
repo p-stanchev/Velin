@@ -440,6 +440,11 @@ mod platform {
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxSystemCapture)> {
         let monitor_source = detect_monitor_source(selected_source);
         let sample_rate_hz = SAMPLE_RATE_HZ;
+        eprintln!(
+            "linux system capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
+            monitor_source,
+            sample_rate_hz
+        );
         let mut last_error = None;
 
         for candidate in launch_candidates(&monitor_source, sample_rate_hz) {
@@ -547,6 +552,11 @@ mod platform {
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
         let microphone_source = detect_microphone_source(selected_source);
         let sample_rate_hz = SAMPLE_RATE_HZ;
+        eprintln!(
+            "linux microphone capture config: selected={selected_source:?}, resolved={:?}, rate={} Hz, channels=2, format=s16le",
+            microphone_source,
+            sample_rate_hz
+        );
         let mut last_error = None;
 
         for candidate in microphone_launch_candidates(&microphone_source, sample_rate_hz) {
@@ -668,6 +678,12 @@ mod platform {
     }
 
     fn spawn_capture_process(candidate: &CaptureCommand) -> Result<Child> {
+        eprintln!(
+            "starting {}: {} {}",
+            candidate.description,
+            candidate.program,
+            candidate.args.join(" ")
+        );
         let mut child = Command::new(candidate.program)
             .args(&candidate.args)
             .stdout(Stdio::piped())
