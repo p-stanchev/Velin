@@ -112,13 +112,36 @@ pub fn default_system_capture_source_name() -> Result<Option<String>> {
 }
 
 struct MicrophoneCapture {
-    _stream: Stream,
+    _backend: MicrophoneBackend,
+}
+
+enum MicrophoneBackend {
+    Stream { _stream: Stream },
+    #[cfg(target_os = "linux")]
+    LinuxPipe { _pipe: LinuxPulseCapture },
 }
 
 struct MixedCapture {
     _system: PlatformCapture,
     _microphone: MicrophoneCapture,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPulseCapture {
+    child: std::process::Child,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxPulseCapture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl Drop for MixedCapture {
@@ -179,6 +202,23 @@ fn start_mixed_capture(
 fn start_microphone_capture(
     selected_name: &str,
 ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, MicrophoneCapture)> {
+    #[cfg(target_os = "linux")]
+    if let Ok((sample_rate_hz, receiver, pipe)) = platform::start_microphone_capture(selected_name) {
+        return Ok((
+            sample_rate_hz,
+            receiver,
+            MicrophoneCapture {
+                _backend: MicrophoneBackend::LinuxPipe { _pipe: pipe },
+            },
+        ));
+    }
+
+    start_microphone_capture_cpal(selected_name)
+}
+
+fn start_microphone_capture_cpal(
+    selected_name: &str,
+) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, MicrophoneCapture)> {
     let host = cpal::default_host();
     let device = select_input_device(&host, selected_name)?;
     let supported_config = device.default_input_config()?;
@@ -208,7 +248,13 @@ fn start_microphone_capture(
 
     stream.play()?;
 
-    Ok((sample_rate_hz, receiver, MicrophoneCapture { _stream: stream }))
+    Ok((
+        sample_rate_hz,
+        receiver,
+        MicrophoneCapture {
+            _backend: MicrophoneBackend::Stream { _stream: stream },
+        },
+    ))
 }
 
 struct MicrophoneBuffer {
@@ -350,6 +396,7 @@ type PlatformCapture = platform::UnsupportedCapture;
 #[cfg(target_os = "linux")]
 mod platform {
     use anyhow::{Context, Result, anyhow};
+    use crate::LinuxPulseCapture;
     use std::env;
     use std::io::Read;
     use std::process::{Child, Command, Stdio};
@@ -452,6 +499,60 @@ mod platform {
         detect_monitor_source("")
     }
 
+    pub fn start_microphone_capture(
+        selected_source: &str,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<i16>>, LinuxPulseCapture)> {
+        let microphone_source = detect_microphone_source(selected_source);
+        let sample_rate_hz = detect_monitor_sample_rate(microphone_source.as_deref()).unwrap_or(SAMPLE_RATE_HZ);
+        let mut last_error = None;
+
+        for candidate in microphone_launch_candidates(&microphone_source, sample_rate_hz) {
+            match spawn_capture_process(&candidate) {
+                Ok(mut child) => {
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .context("microphone capture process did not provide a stdout stream")?;
+                    let (sender, receiver) = mpsc::unbounded_channel();
+                    let thread = thread::Builder::new()
+                        .name("velin-linux-microphone".to_string())
+                        .spawn(move || {
+                            let mut stdout = stdout;
+                            let mut bytes =
+                                vec![0_u8; samples_per_10ms(sample_rate_hz) * CHANNELS as usize * 2];
+                            loop {
+                                if stdout.read_exact(&mut bytes).is_err() {
+                                    break;
+                                }
+
+                                let mut samples = Vec::with_capacity(bytes.len() / 2);
+                                for chunk in bytes.chunks_exact(2) {
+                                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                                }
+
+                                if sender.send(samples).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .context("failed to spawn Linux microphone capture thread")?;
+
+                    return Ok((
+                        sample_rate_hz,
+                        receiver,
+                        LinuxPulseCapture {
+                            child,
+                            thread: Some(thread),
+                        },
+                    ));
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to start Linux microphone capture")))
+    }
+
     #[derive(Clone)]
     struct CaptureCommand {
         program: &'static str,
@@ -481,6 +582,37 @@ mod platform {
                     "--channels=2".to_string(),
                 ],
                 description: format!("parec monitor source {source}"),
+            });
+        }
+
+        candidates
+    }
+
+    fn microphone_launch_candidates(source: &Option<String>, sample_rate_hz: u32) -> Vec<CaptureCommand> {
+        let mut candidates = Vec::new();
+        let mut sources = Vec::new();
+
+        if let Some(source) = source {
+            sources.push(source.clone());
+        }
+        if !sources.iter().any(|value| value == "@DEFAULT_SOURCE@") {
+            sources.push("@DEFAULT_SOURCE@".to_string());
+        }
+
+        for source in sources {
+            candidates.push(CaptureCommand {
+                program: "parec",
+                args: vec![
+                    format!("--device={source}"),
+                    "--raw".to_string(),
+                    "--format=s16le".to_string(),
+                    "--fix-format".to_string(),
+                    "--fix-rate".to_string(),
+                    "--fix-channels".to_string(),
+                    format!("--rate={sample_rate_hz}"),
+                    "--channels=2".to_string(),
+                ],
+                description: format!("parec microphone source {source}"),
             });
         }
 
@@ -535,6 +667,44 @@ mod platform {
                         let sink = value.trim();
                         if !sink.is_empty() {
                             return Some(format!("{sink}.monitor"));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn detect_microphone_source(selected_source: &str) -> Option<String> {
+        let trimmed_selected = selected_source.trim();
+        if !trimmed_selected.is_empty() && trimmed_selected != "System Default" {
+            return Some(trimmed_selected.to_string());
+        }
+
+        if let Ok(value) = env::var("VELIN_LINUX_MIC_SOURCE") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(output) = Command::new("pactl").args(["get-default-source"]).output() {
+            if output.status.success() {
+                let source = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !source.is_empty() {
+                    return Some(source);
+                }
+            }
+        }
+
+        if let Ok(output) = Command::new("pactl").args(["info"]).output() {
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Some(value) = line.strip_prefix("Default Source:") {
+                        let source = value.trim();
+                        if !source.is_empty() {
+                            return Some(source.to_string());
                         }
                     }
                 }
