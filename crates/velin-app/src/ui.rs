@@ -918,7 +918,7 @@ slint::slint! {
                                         border-radius: 12px;
                                         background: root.dark-mode ? #181b18 : #fbfaf7;
                                         height: root.trusted-fingerprint-selection == "No trusted fingerprints"
-                                            && root.trusted-fingerprint-options.length == 1 ? 54px : 92px;
+                                            && root.trusted-fingerprint-options.length == 1 ? 50px : 50px;
 
                                         ScrollView {
                                             x: 8px;

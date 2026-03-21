@@ -16,6 +16,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
+use tokio::time::{Duration, sleep};
 
 #[derive(Default)]
 struct SessionState {
@@ -159,10 +160,14 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
 
     {
         let app_handle = app.as_weak();
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
         app.on_select_settings_tab(move || {
             if let Some(app) = app_handle.upgrade() {
                 app.set_active_tab(2);
                 app.set_discovered_peer_menu_open(false);
+                if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+                    app.set_status_text(format!("Failed to refresh fingerprint settings: {error:#}").into());
+                }
             }
         });
     }
@@ -346,8 +351,10 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
     let pairing_prompt = make_pairing_prompt(&app.as_weak(), &pairing_state);
 
     {
+        let runtime = Arc::clone(&runtime);
         let weak = app.as_weak();
         let pairing_state = Arc::clone(&pairing_state);
+        let trusted_fingerprints = Arc::clone(&trusted_fingerprints);
         app.on_pairing_decision(move |approved| {
             let sender = {
                 let mut state = pairing_state.lock().expect("pairing state poisoned");
@@ -361,6 +368,10 @@ pub fn run_gui(runtime: Arc<Runtime>) -> Result<()> {
                 let _ = sender.send(approved);
             }
             clear_pairing_prompt(&weak, &pairing_state);
+            if approved {
+                schedule_security_refresh(&runtime, &weak, &trusted_fingerprints, 150);
+                schedule_security_refresh(&runtime, &weak, &trusted_fingerprints, 750);
+            }
         });
     }
 
@@ -575,6 +586,33 @@ fn refresh_security_settings(
     }
 
     Ok(())
+}
+
+fn refresh_security_settings_for_weak(
+    weak: &slint::Weak<AppWindow>,
+    trusted_fingerprints: &Arc<Mutex<Vec<TrustedFingerprintChoice>>>,
+) {
+    let weak = weak.clone();
+    let trusted_fingerprints = Arc::clone(trusted_fingerprints);
+    let _ = weak.upgrade_in_event_loop(move |app| {
+        if let Err(error) = refresh_security_settings(&app, &trusted_fingerprints) {
+            app.set_status_text(format!("Failed to refresh fingerprint settings: {error:#}").into());
+        }
+    });
+}
+
+fn schedule_security_refresh(
+    runtime: &Arc<Runtime>,
+    weak: &slint::Weak<AppWindow>,
+    trusted_fingerprints: &Arc<Mutex<Vec<TrustedFingerprintChoice>>>,
+    delay_ms: u64,
+) {
+    let weak = weak.clone();
+    let trusted_fingerprints = Arc::clone(trusted_fingerprints);
+    runtime.spawn(async move {
+        sleep(Duration::from_millis(delay_ms)).await;
+        refresh_security_settings_for_weak(&weak, &trusted_fingerprints);
+    });
 }
 
 fn apply_peer_options(
