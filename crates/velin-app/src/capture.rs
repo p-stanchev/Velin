@@ -827,6 +827,10 @@ mod platform {
             return None;
         }
 
+        if let Some(rate_hz) = detect_source_sample_rate_short(source_name) {
+            return Some(rate_hz);
+        }
+
         let output = Command::new("pactl").args(["list", "sources"]).output().ok()?;
         if !output.status.success() {
             return None;
@@ -844,9 +848,41 @@ mod platform {
 
             if current_name == Some(source_name) {
                 if let Some(spec) = trimmed.strip_prefix("Sample Specification:") {
-                    return parse_sample_rate_from_spec(spec.trim());
+                    let parsed = parse_sample_rate_from_spec(spec.trim());
+                    eprintln!(
+                        "linux source spec (verbose): name={source_name}, spec={:?}, parsed_rate={parsed:?}",
+                        spec.trim()
+                    );
+                    return parsed;
                 }
             }
+        }
+
+        eprintln!("linux source spec: no sample rate match found for {source_name}");
+        None
+    }
+
+    fn detect_source_sample_rate_short(source_name: &str) -> Option<u32> {
+        let output = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let columns = line.split('\t').collect::<Vec<_>>();
+            if columns.len() < 4 || columns[1].trim() != source_name {
+                continue;
+            }
+
+            let sample_spec = columns[3].trim();
+            let parsed = parse_sample_rate_from_spec(sample_spec);
+            eprintln!(
+                "linux source spec (short): name={source_name}, spec={sample_spec:?}, parsed_rate={parsed:?}"
+            );
+            return parsed;
         }
 
         None
