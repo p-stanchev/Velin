@@ -890,9 +890,10 @@ mod platform {
 
     fn parse_sample_rate_from_spec(spec: &str) -> Option<u32> {
         for token in spec.split_whitespace() {
-            let rate = token.strip_suffix("Hz")?;
-            if let Ok(parsed) = rate.parse::<u32>() {
-                return Some(parsed);
+            if let Some(rate) = token.strip_suffix("Hz") {
+                if let Ok(parsed) = rate.parse::<u32>() {
+                    return Some(parsed);
+                }
             }
         }
         None
