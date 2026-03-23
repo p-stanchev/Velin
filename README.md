@@ -30,7 +30,7 @@ LAN audio routing beta for Windows and Linux
 
 ## Current State
 
-Velin is now usable as a beta, but it is not a polished full release yet.
+Velin is now usable as a beta!
 
 What exists now:
 
