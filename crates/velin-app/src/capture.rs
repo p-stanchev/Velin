@@ -419,7 +419,7 @@ mod platform {
     use std::thread;
     use std::time::Duration;
     use tokio::sync::mpsc;
-    use velin_proto::{CHANNELS, SAMPLE_RATE_HZ};
+    use velin_proto::{CHANNELS, SAMPLE_RATE_HZ, frame_samples_per_channel};
 
     pub struct LinuxSystemCapture {
         child: Child,
