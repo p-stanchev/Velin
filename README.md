@@ -9,12 +9,12 @@ LAN audio routing beta for Windows and Linux
 [![Rust](https://img.shields.io/badge/Rust-systems-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Windows](https://img.shields.io/badge/Windows-tested-0078D6?style=flat-square&logo=windows)](.)
 [![Linux](https://img.shields.io/badge/Linux-target-FCC624?style=flat-square&logo=linux&logoColor=black)](.)
-[![Status](https://img.shields.io/badge/status-0.2.0--beta.1-555?style=flat-square)](.)
+[![Status](https://img.shields.io/badge/status-0.2.1--beta.1-555?style=flat-square)](.)
 [![License](https://img.shields.io/badge/license-MIT-111111?style=flat-square)](LICENSE)
 
 </div>
 
-> Velin `0.2.0-beta.1` is a cross-platform LAN audio routing beta for sending system audio and microphone audio between Windows and Linux machines on the same local network. It includes a desktop GUI, headless/session commands, encrypted pairing, receiver discovery, saved settings, and a working TCP/UDP transport path.
+> Velin `0.2.1-beta.1` is a cross-platform LAN audio routing beta for sending system audio and microphone audio between Windows and Linux machines on the same local network. It includes a desktop GUI, headless/session commands, encrypted pairing, receiver discovery, saved settings, and a working TCP/UDP transport path.
 
 <p align="center">
   <a href="#current-state">Current State</a> |
