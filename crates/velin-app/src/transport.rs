@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time;
 use velin_proto::{
     Accept, AudioFrame, CHANNELS, DEFAULT_DISCOVERY_PORT, DiscoveryAnnouncement, DiscoveryPacket,
-    Hello, PairingDecision, PairingRequired,
+    Hello, PairingDecision, PairingRequired, frame_samples_per_channel,
 };
 
 pub type StatusSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -649,7 +649,7 @@ async fn run_discovery_broadcaster(
 }
 
 fn frame_duration_for(sequence: u64, sample_rate_hz: u32) -> Duration {
-    let samples_per_channel = samples_per_10ms(sample_rate_hz) as f64;
+    let samples_per_channel = frame_samples_per_channel(sample_rate_hz) as f64;
     let seconds = (sequence as f64 * samples_per_channel) / sample_rate_hz as f64;
     Duration::from_secs_f64(seconds)
 }
@@ -665,12 +665,8 @@ fn describe_short_error(error: &anyhow::Error) -> String {
     text.lines().next().unwrap_or("unknown error").to_string()
 }
 
-fn samples_per_10ms(sample_rate_hz: u32) -> usize {
-    ((sample_rate_hz as u64 * 10) / 1000) as usize
-}
-
 fn frame_sample_count(sample_rate_hz: u32) -> usize {
-    samples_per_10ms(sample_rate_hz) * CHANNELS as usize
+    frame_samples_per_channel(sample_rate_hz) * CHANNELS as usize
 }
 
 impl ReceiverStreamState {

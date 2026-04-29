@@ -3,9 +3,13 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONTROL_PORT: u16 = 49000;
 pub const DEFAULT_AUDIO_PORT: u16 = 49001;
 pub const DEFAULT_DISCOVERY_PORT: u16 = 49002;
-pub const FRAME_SAMPLES: usize = 480;
+pub const FRAME_DURATION_MS: u32 = 5;
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+
+pub fn frame_samples_per_channel(sample_rate_hz: u32) -> usize {
+    ((sample_rate_hz as u64 * FRAME_DURATION_MS as u64) / 1000) as usize
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {

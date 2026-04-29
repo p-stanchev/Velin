@@ -282,6 +282,7 @@ New-NetFirewallRule -DisplayName "Velin UDP 49002" -Direction Inbound -Action Al
 - If Linux sender capture produces no audio, verify `parec` is installed and the selected monitor/source exists in `pactl list short sources`.
 - If Linux receiver playback fails, verify `aplay` is installed and the selected output device is healthy.
 - If Linux playback is a little choppy on older hardware, increase the system load headroom first: close other apps, reduce stream count, and retest before changing app settings.
+- If Windows reports `OS Error 10040`, the network path is rejecting oversized UDP datagrams. Update to a build with smaller audio frames and retest on the same LAN.
 
 ---
 

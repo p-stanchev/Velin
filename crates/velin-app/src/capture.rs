@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::mpsc;
-use velin_proto::CHANNELS;
+use velin_proto::{CHANNELS, frame_samples_per_channel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,7 +285,7 @@ impl MicrophoneBuffer {
         Self {
             sender,
             mono_samples: VecDeque::new(),
-            chunk_frames: ((sample_rate_hz as u64 * 10) / 1000) as usize,
+            chunk_frames: frame_samples_per_channel(sample_rate_hz),
             channels: channels.max(1),
         }
     }
@@ -993,7 +993,7 @@ mod platform {
     }
 
     fn samples_per_10ms(sample_rate_hz: u32) -> usize {
-        ((sample_rate_hz as u64 * 10) / 1000) as usize
+        frame_samples_per_channel(sample_rate_hz)
     }
 }
 
